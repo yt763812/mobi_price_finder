@@ -34,6 +34,8 @@ def init_db():
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
+            cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'UNKNOWN'")
+            cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS tax_status TEXT NOT NULL DEFAULT 'unknown'")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS offers (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -72,11 +74,11 @@ def add_supplier(name, telegram_user_id=None, validity_hours=72):
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO suppliers(name, telegram_user_id, validity_hours)
-                VALUES (%s, %s, %s)
+                INSERT INTO suppliers(name, telegram_user_id, validity_hours, currency)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (name) DO NOTHING
                 RETURNING id
-            """, (name.strip(), telegram_user_id, validity_hours))
+            """, (name.strip(), telegram_user_id, validity_hours, 'UNKNOWN'))
             row = cur.fetchone()
             if row:
                 return row["id"]
@@ -177,5 +179,92 @@ def list_suppliers():
     """Show registered suppliers without exposing database credentials."""
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, validity_hours FROM suppliers ORDER BY name")
+            cur.execute("SELECT id, name, validity_hours, currency, tax_status FROM suppliers ORDER BY name")
             return cur.fetchall()
+
+
+def get_supplier(supplier_id):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, validity_hours, currency, tax_status FROM suppliers WHERE id=%s", (supplier_id,))
+            return cur.fetchone()
+
+
+def update_supplier_settings(supplier_id, currency=None, tax_status=None):
+    if currency is not None and currency not in ('USD', 'BYN', 'RUB', 'EUR'):
+        raise ValueError('Unsupported currency')
+    if tax_status is not None and tax_status not in ('without_vat', 'with_vat', 'unknown'):
+        raise ValueError('Invalid tax status')
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            if currency is not None:
+                cur.execute('UPDATE suppliers SET currency=%s WHERE id=%s', (currency, supplier_id))
+            if tax_status is not None:
+                cur.execute('UPDATE suppliers SET tax_status=%s WHERE id=%s', (tax_status, supplier_id))
+    return get_supplier(supplier_id)
+
+
+def save_price_list(supplier_id, rows):
+    """Save eligible offers atomically; lowest duplicate wins *within this batch*.
+
+    Rows are [(parsed_product, raw_price), ...]. Prices and VAT status are
+    captured from the supplier at import time and never silently recomputed.
+    """
+    supplier = get_supplier(supplier_id)
+    if not supplier:
+        raise ValueError('Supplier not found')
+    if supplier['tax_status'] == 'unknown':
+        raise ValueError('Set supplier VAT status first')
+    if supplier['currency'] not in ('USD', 'BYN', 'RUB', 'EUR'):
+        raise ValueError('Set supplier currency first')
+    by_signature = {}
+    rejected = []
+    for product, raw_price in rows:
+        if not product.get('model') or not product.get('storage_gb'):
+            rejected.append((product['original'], 'модель или память не распознана'))
+            continue
+        if product.get('warnings'):
+            rejected.append((product['original'], 'необходима проверка характеристик'))
+            continue
+        try:
+            amount = Decimal(str(raw_price).replace(',', '.'))
+            if not amount.is_finite() or amount <= 0:
+                raise ValueError('Invalid price')
+        except (ValueError, ArithmeticError, __import__('decimal').InvalidOperation):
+            rejected.append((product['original'], 'некорректная цена'))
+            continue
+        signature = _signature(product)
+        if signature not in by_signature or amount < by_signature[signature][1]:
+            by_signature[signature] = (product, amount)
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for signature, (product, amount) in by_signature.items():
+                cur.execute('''
+                    INSERT INTO offers (
+                        supplier_id, signature, original_name, brand, model,
+                        storage_gb, color, region, sim, condition_tags, warnings,
+                        price, currency, tax_status
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s::jsonb, %s, %s, %s
+                    )
+                    ON CONFLICT (supplier_id, signature) DO UPDATE SET
+                        original_name = EXCLUDED.original_name,
+                        warnings = EXCLUDED.warnings,
+                        price = EXCLUDED.price,
+                        currency = EXCLUDED.currency,
+                        tax_status = EXCLUDED.tax_status,
+                        updated_at = now()
+                ''', (
+                    supplier_id, signature, product['original'],
+                    product.get('brand'), product.get('model'),
+                    product.get('storage_gb'), product.get('color'),
+                    product.get('region'), product.get('sim'),
+                    json.dumps(product.get('condition') or [], ensure_ascii=False),
+                    json.dumps(product.get('warnings') or [], ensure_ascii=False),
+                    amount, supplier['currency'], supplier['tax_status'],
+                ))
+    return {'saved': len(by_signature), 'skipped': len(rejected),
+            'duplicates': len(rows) - len(by_signature) - len(rejected),
+            'rejected': rejected[:5]}
