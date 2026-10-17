@@ -171,3 +171,11 @@ def get_offers(model=None):
                 ORDER BY o.updated_at DESC
             """, (model, model))
             return cur.fetchall()
+
+
+def list_suppliers():
+    """Show registered suppliers without exposing database credentials."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name, validity_hours FROM suppliers ORDER BY name")
+            return cur.fetchall()
