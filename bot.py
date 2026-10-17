@@ -1,45 +1,15 @@
-
-import os
-import re
-import html
-from product_parser import parse_product
-
-
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-
-def parse_price_list(text):
-    text = html.unescape(text)
-    lines = [line.strip(" *\\\t\r") for line in text.splitlines()]
-    lines = [line for line in lines if line]
-
-    products = []
-    pending_name = None
-
-    number = r"\d+(?:[.,]\d{1,2})?"
-
-    for line in lines:
-        # Цена отдельной строкой
+for line in lines:
         if re.fullmatch(number, line):
             if pending_name:
                 products.append((pending_name, line))
                 pending_name = None
             continue
 
-        # Название и цена в одной строке
         match = re.fullmatch(
             rf"(.+?)\s+({number})\s*(?:\$|USD)?",
             line,
             re.IGNORECASE,
         )
-
         if match:
             name, price = match.groups()
             products.append((name.strip(), price))
@@ -51,20 +21,20 @@ def parse_price_list(text):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "👋 Привет! Я Mobi Price Finder.\n\n"
-        "Пришли мне текстовый прайс, "
-        "и я попробую распознать товары и цены."
+        "Отправь мне текстовый прайс, и я попробую распознать товары и цены."
     )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    products = parse_price_list(update.message.text)
+    message = update.effective_message
+    if not message or not message.text:
+        return
 
+    products = parse_price_list(message.text)
     if not products:
-        await update.message.reply_text(
-            "Не удалось распознать товары и цены."
-        )
+        await message.reply_text("Не удалось распознать товары и цены.")
         return
 
     result = [
@@ -74,50 +44,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Первые 10 товаров:",
     ]
 
-   
-for name, price in products[:10]:
-    product = parse_product(name)
-
-    result.append(f"📱 {name}")
-    result.append(f"💰 Цена: {price}")
-
-    if product["model"]:
-        result.append(f"✅ Модель: {product['model']}")
-    else:
-        result.append("⚠️ Модель не определена")
-
-    if product["storage_gb"]:
+    for name, price in products[:10]:
+        product = parse_product(name)
+        result.append(f"📱 {name}")
+        result.append(f"💰 Цена: {price}")
         result.append(
-            f"💾 Память: {product['storage_gb']} GB"
+            f"✅ Модель: {product['model']}"
+            if product['model'] else "⚠️ Модель не определена"
         )
-
-    if product["color"]:
-        result.append(f"🎨 Цвет: {product['color']}")
-
-    result.append("")
-
+        if product['storage_gb'] is not None:
+            result.append(f"💾 Память: {product['storage_gb']} GB")
+        if product['color']:
+            result.append(f"🎨 Цвет: {product['color']}")
+        result.append("")
 
     if len(products) > 10:
-        result.append(f"\nИ ещё {len(products) - 10} позиций.")
+        result.append(f"И ещё {len(products) - 10} позиций.")
 
-    result.append(
-        "\n⚠️ Тестовый режим: товары пока не сохраняются."
-    )
+    result.append("⚠️ Тестовый режим: товары пока не сохраняются.")
+    await message.reply_text("\n".join(result)[:4000])
 
-    await update.message.reply_text("\n".join(result))
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Ошибка обработки сообщения: %s", context.error, exc_info=context.error)
 
 
 def main():
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("В Railway отсутствует TELEGRAM_BOT_TOKEN")
 
     app = ApplicationBuilder().token(token).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
 
-    print("Mobi Price Finder запущен")
+    logger.info("Mobi Price Finder запускается")
     app.run_polling()
 
 
