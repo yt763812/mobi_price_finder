@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 
 from product_parser import parse_product
+from database import init_db
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -114,6 +115,10 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("В Railway отсутствует TELEGRAM_BOT_TOKEN")
+
+    logger.info("Подключаемся к PostgreSQL и проверяем таблицы...")
+    init_db()
+    logger.info("PostgreSQL: подключение успешно, таблицы готовы")
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
