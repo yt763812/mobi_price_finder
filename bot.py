@@ -2,6 +2,8 @@
 import os
 import re
 import html
+from product_parser import parse_product
+
 
 from telegram import Update
 from telegram.ext import (
@@ -72,8 +74,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Первые 10 товаров:",
     ]
 
-    for name, price in products[:10]:
-        result.append(f"• {name} — {price}")
+   
+for name, price in products[:10]:
+    product = parse_product(name)
+
+    result.append(f"📱 {name}")
+    result.append(f"💰 Цена: {price}")
+
+    if product["model"]:
+        result.append(f"✅ Модель: {product['model']}")
+    else:
+        result.append("⚠️ Модель не определена")
+
+    if product["storage_gb"]:
+        result.append(
+            f"💾 Память: {product['storage_gb']} GB"
+        )
+
+    if product["color"]:
+        result.append(f"🎨 Цвет: {product['color']}")
+
+    result.append("")
+
 
     if len(products) > 10:
         result.append(f"\nИ ещё {len(products) - 10} позиций.")
