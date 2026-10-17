@@ -10,7 +10,7 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 from database import (
-    add_supplier, get_supplier, init_db, list_suppliers,
+    add_supplier, get_supplier, get_supplier_offers, init_db, list_suppliers,
     save_price_list, update_supplier_settings,
 )
 from product_parser import parse_product
@@ -88,6 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 Mobi Price Finder\n\n/suppliers — выбрать/добавить поставщика\n"
         "/settings — валюта и НДС выбранного поставщика\n"
+        "/prices — сохранённые цены выбранного поставщика\n"
         "Пришли текстовый прайс — проверим его перед сохранением."
     )
 
@@ -117,6 +118,59 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ {s['name']}\nВалюта: {s['currency']}\nНДС: {s['tax_status']}",
         reply_markup=settings_keyboard(s),
     )
+
+
+async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorize(update):
+        return
+    sid = context.user_data.get('supplier_id')
+    supplier = get_supplier(sid) if sid else None
+    if supplier is None:
+        await update.effective_message.reply_text(
+            'Сначала выбери поставщика через /suppliers.'
+        )
+        return
+
+    offers = get_supplier_offers(supplier['id'], limit=20)
+    if not offers:
+        await update.effective_message.reply_text(
+            f"У поставщика «{supplier['name']}» пока нет сохранённых предложений."
+        )
+        return
+
+    lines = [f"📦 {supplier['name']} — последние {len(offers)} предложений:"]
+    for i, offer in enumerate(offers, 1):
+        price = (f"{offer['price']} {offer['currency'] or 'валюта неизвестна'}"
+                 if offer['price'] is not None else 'По запросу')
+        fields = []
+        if offer['region']:
+            fields.append(f"регион: {offer['region']}")
+        if offer['sim']:
+            fields.append(f"SIM: {offer['sim']}")
+        if offer['tax_status'] == 'with_vat':
+            fields.append('с НДС')
+        elif offer['tax_status'] == 'without_vat':
+            fields.append('без НДС')
+        freshness = 'актуально' if offer['is_fresh'] else 'срок актуальности истёк'
+        date = offer['updated_at'].strftime('%d.%m.%Y %H:%M UTC')
+        details = ' | '.join(fields)
+        lines.append(
+            f"\n{i}. {offer['original_name']}\n"
+            f"💰 {price}\n"
+            + (f"{details}\n" if details else '')
+            + f"🕒 {date} · {freshness}"
+        )
+
+    # Telegram limits messages to 4096 characters.
+    text = ''
+    for line in lines:
+        if len(text) + len(line) + 1 > 3500:
+            if text:
+                await update.effective_message.reply_text(text)
+            text = ''
+        text += ('\n' if text else '') + line
+    if text:
+        await update.effective_message.reply_text(text)
 
 
 async def show_pending(message, context):
@@ -241,7 +295,7 @@ def main():
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
     app = ApplicationBuilder().token(token).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
-                             ('addsupplier', addsupplier), ('settings', settings)]:
+                             ('addsupplier', addsupplier), ('settings', settings), ('prices', prices)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
