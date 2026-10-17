@@ -1,4 +1,36 @@
-for line in lines:
+import os
+import re
+import html
+import logging
+
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from product_parser import parse_product
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+def parse_price_list(text: str):
+    text = html.unescape(text)
+    lines = [line.strip(" *\\\t\r") for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    products = []
+    pending_name = None
+    number = r"\d+(?:[.,]\d{1,2})?"
+
+    for line in lines:
         if re.fullmatch(number, line):
             if pending_name:
                 products.append((pending_name, line))
