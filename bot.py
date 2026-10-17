@@ -10,7 +10,7 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 from database import (
-    add_supplier, get_supplier, get_supplier_offers, init_db, list_suppliers,
+    add_supplier, get_supplier, get_supplier_offers, get_offers, init_db, list_suppliers,
     save_price_list, update_supplier_settings,
 )
 from product_parser import parse_product
@@ -89,6 +89,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Mobi Price Finder\n\n/suppliers — выбрать/добавить поставщика\n"
         "/settings — валюта и НДС выбранного поставщика\n"
         "/prices — сохранённые цены выбранного поставщика\n"
+        "/find iPhone 17 Pro 256GB Black — сравнить поставщиков\n"
         "Пришли текстовый прайс — проверим его перед сохранением."
     )
 
@@ -285,6 +286,80 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_pending(update.effective_message, context)
 
 
+
+async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorize(update):
+        return
+    query_text = " ".join(context.args or []).strip()
+    if not query_text:
+        await update.effective_message.reply_text(
+            "Пример: /find iPhone 17 Pro 256GB Black\n"
+            "Можно также написать: /find Айфон 17 Про 256 ГБ чёрный"
+        )
+        return
+
+    requested = parse_product(query_text)
+    if not requested.get("model") or not requested.get("storage_gb"):
+        await update.effective_message.reply_text(
+            "Не удалось однозначно распознать модель и память. "
+            "Попробуй: /find iPhone 17 Pro 256GB Black"
+        )
+        return
+
+    # We deliberately do not guess the currency or convert VAT-inclusive prices.
+    confirmed, uncertain = [], []
+    excluded_financial = 0
+    excluded_expired = 0
+    for offer in get_offers(model=requested["model"]):
+        if offer["storage_gb"] != requested["storage_gb"]:
+            continue
+        mismatch = False
+        unknown = []
+        for field, label in (("color", "цвет"), ("region", "регион"),
+                             ("sim", "SIM")):
+            desired = requested.get(field)
+            if desired is None:
+                continue
+            actual = offer.get(field)
+            if actual is None:
+                unknown.append(label)
+            elif actual != desired:
+                mismatch = True
+                break
+        if mismatch:
+            continue
+        if offer["currency"] != "USD" or offer["tax_status"] != "without_vat" or offer["price"] is None:
+            excluded_financial += 1
+            continue
+        if not offer["is_fresh"]:
+            excluded_expired += 1
+            continue
+        if offer.get("warnings"):
+            unknown.append("предупреждения о характеристиках")
+        (uncertain if unknown else confirmed).append((offer, unknown))
+
+    confirmed.sort(key=lambda item: (item[0]["price"], item[0]["supplier_name"]))
+    uncertain.sort(key=lambda item: (item[0]["price"], item[0]["supplier_name"]))
+
+    lines = [f"🔎 {query_text}", "Условия: актуальные цены USD, без НДС."]
+    if confirmed:
+        winner = confirmed[0][0]
+        lines += ["", f"🏆 Лучшая подтверждённая цена: {winner['price']} USD",
+                  f"Поставщик: {winner['supplier_name']}", "", "✅ Совпадения:"]
+        for offer, _ in confirmed[:10]:
+            lines.append(f"• {offer['supplier_name']}: {offer['price']} USD — {offer['original_name']}")
+    else:
+        lines += ["", "✅ Подтверждённых совпадений нет."]
+    if uncertain:
+        lines += ["", "⚠️ Возможные совпадения (не участвуют в выборе лучшей цены):"]
+        for offer, missing in uncertain[:10]:
+            lines.append(f"• {offer['supplier_name']}: {offer['price']} USD — {offer['original_name']}"
+                         f"; уточнить: {', '.join(missing)}")
+    if excluded_financial or excluded_expired:
+        lines += ["", f"Исключено: {excluded_financial} с другой валютой/НДС; "
+                  f"{excluded_expired} устаревших."]
+    await update.effective_message.reply_text("\n".join(lines)[:4000])
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Telegram error: %s", context.error, exc_info=context.error)
 
@@ -295,7 +370,7 @@ def main():
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
     app = ApplicationBuilder().token(token).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
-                             ('addsupplier', addsupplier), ('settings', settings), ('prices', prices)]:
+                             ('addsupplier', addsupplier), ('settings', settings), ('prices', prices), ('find', find)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
