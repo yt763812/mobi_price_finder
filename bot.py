@@ -55,6 +55,38 @@ def parse_price_list(text):
     return output
 
 
+def mode_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Авто", callback_data="mode:auto"),
+         InlineKeyboardButton("🔎 Поиск", callback_data="mode:search")],
+        [InlineKeyboardButton("📥 Загрузка прайса", callback_data="mode:import")],
+        [InlineKeyboardButton("👥 Поставщики", callback_data="nav:suppliers"),
+         InlineKeyboardButton("⚙️ Настройки", callback_data="nav:settings")],
+    ])
+
+
+def decision_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Искать", callback_data="decide:search"),
+         InlineKeyboardButton("📥 Это прайс", callback_data="decide:import")],
+    ])
+
+
+async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorize(update):
+        return
+    current = context.user_data.get('mode', 'auto')
+    labels = {'auto': 'Авто', 'search': 'Поиск', 'import': 'Загрузка прайса'}
+    await update.effective_message.reply_text(
+        f"Режим: {labels.get(current, 'Авто')}. Выбери нужный:",
+        reply_markup=mode_keyboard(),
+    )
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await mode(update, context)
+
+
 def keyboard_suppliers():
     buttons = [[InlineKeyboardButton(s['name'], callback_data=f"pick:{s['id']}")]
                for s in list_suppliers()[:75]]
@@ -90,7 +122,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/settings — валюта и НДС выбранного поставщика\n"
         "/prices — сохранённые цены выбранного поставщика\n"
         "/find iPhone 17 Pro 256GB Black — сравнить поставщиков\n"
-        "Пришли текстовый прайс — проверим его перед сохранением."
+        "/menu — меню и режим работы\n"
+        "Просто напиши название товара — бот выполнит поиск.\n"
+        "Прайсы с ценами бот предложит сохранить.",
+        reply_markup=mode_keyboard(),
     )
 
 
@@ -212,7 +247,40 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     action = query.data or ''
-    if action == 'supplier:new':
+    if action.startswith('mode:'):
+        mode_name = action.split(':', 1)[1]
+        if mode_name not in ('auto', 'search', 'import'):
+            return
+        context.user_data['mode'] = mode_name
+        labels = {'auto': 'Авто', 'search': 'Поиск', 'import': 'Загрузка прайса'}
+        await query.message.reply_text(f"✅ Режим: {labels[mode_name]}")
+    elif action == 'nav:suppliers':
+        await query.message.reply_text('Выбери поставщика:', reply_markup=keyboard_suppliers())
+    elif action == 'nav:settings':
+        sid = context.user_data.get('supplier_id')
+        supplier = get_supplier(sid) if sid else None
+        if supplier:
+            await query.message.reply_text(
+                f"⚙️ {supplier['name']}", reply_markup=settings_keyboard(supplier)
+            )
+        else:
+            await query.message.reply_text('Сначала выбери поставщика:', reply_markup=keyboard_suppliers())
+    elif action.startswith('decide:'):
+        raw = context.user_data.pop('undecided_text', None)
+        if not raw:
+            await query.message.reply_text('Сообщение для обработки уже отсутствует. Пришли его ещё раз.')
+            return
+        decision = action.split(':', 1)[1]
+        if decision == 'search':
+            await run_search(query.message, raw)
+        elif decision == 'import':
+            rows = parse_price_list(raw)
+            if not rows:
+                await query.message.reply_text('В сообщении нет распознанных пар «товар — цена».')
+            else:
+                context.user_data['pending'] = rows
+                await show_pending(query.message, context)
+    elif action == 'supplier:new':
         context.user_data['await_name'] = True
         await query.message.reply_text("Введи название нового поставщика одним сообщением.")
     elif action.startswith('pick:'):
@@ -278,12 +346,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f'✅ Поставщик «{text}» добавлен/выбран.')
         await show_pending(update.effective_message, context)
         return
-    rows = parse_price_list(text)
-    if not rows:
-        await update.effective_message.reply_text('Не удалось найти пары «товар — цена».')
+    current_mode = context.user_data.get('mode', 'auto')
+    if current_mode == 'search':
+        await run_search(update.effective_message, text)
         return
-    context.user_data['pending'] = rows
-    await show_pending(update.effective_message, context)
+
+    rows = parse_price_list(text)
+    if current_mode == 'import':
+        if not rows:
+            await update.effective_message.reply_text(
+                'Не найдено пар «товар — цена». Проверь формат прайса или выбери «Авто».'
+            )
+            return
+        context.user_data['pending'] = rows
+        await show_pending(update.effective_message, context)
+        return
+
+    # В авторежиме одиночное название без цены — поиск по всем поставщикам.
+    # Даже один товар с ценой может оказаться как прайсом, так и запросом;
+    # в этом случае не принимаем решение без пользователя.
+    if len(rows) >= 2:
+        context.user_data['pending'] = rows
+        await show_pending(update.effective_message, context)
+    elif len(rows) == 1 or ('\n' in text and not rows):
+        context.user_data['undecided_text'] = text
+        await update.effective_message.reply_text(
+            'Это поиск товара или загрузка прайса?', reply_markup=decision_keyboard()
+        )
+    else:
+        await run_search(update.effective_message, text)
 
 
 
@@ -293,16 +384,22 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = " ".join(context.args or []).strip()
     if not query_text:
         await update.effective_message.reply_text(
-            "Пример: /find iPhone 17 Pro 256GB Black\n"
-            "Можно также написать: /find Айфон 17 Про 256 ГБ чёрный"
+            'Просто напиши название товара, например: айфон 17 про 256 чёрный'
         )
         return
+    await run_search(update.effective_message, query_text)
 
+
+async def run_search(message, query_text):
+    query_text = query_text.strip()
+    if not query_text:
+        await message.reply_text('Напиши название товара для поиска.')
+        return
     requested = parse_product(query_text)
     if not requested.get("model") or not requested.get("storage_gb"):
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Не удалось однозначно распознать модель и память. "
-            "Попробуй: /find iPhone 17 Pro 256GB Black"
+            "Попробуй: iPhone 17 Pro 256GB Black"
         )
         return
 
@@ -358,7 +455,7 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if excluded_financial or excluded_expired:
         lines += ["", f"Исключено: {excluded_financial} с другой валютой/НДС; "
                   f"{excluded_expired} устаревших."]
-    await update.effective_message.reply_text("\n".join(lines)[:4000])
+    await message.reply_text("\n".join(lines)[:4000])
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Telegram error: %s", context.error, exc_info=context.error)
@@ -370,7 +467,8 @@ def main():
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
     app = ApplicationBuilder().token(token).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
-                             ('addsupplier', addsupplier), ('settings', settings), ('prices', prices), ('find', find)]:
+                             ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
+                             ('find', find), ('menu', menu), ('mode', mode)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
