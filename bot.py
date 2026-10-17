@@ -1,14 +1,15 @@
-import os
-import re
+"""Mobi Price Finder — тестовый приём и разбор текстовых прайсов."""
 import html
 import logging
+import os
+import re
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
@@ -25,7 +26,6 @@ def parse_price_list(text: str):
     text = html.unescape(text)
     lines = [line.strip(" *\\\t\r") for line in text.splitlines()]
     lines = [line for line in lines if line]
-
     products = []
     pending_name = None
     number = r"\d+(?:[.,]\d{1,2})?"
@@ -55,7 +55,7 @@ def parse_price_list(text: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "👋 Привет! Я Mobi Price Finder.\n\n"
-        "Отправь мне текстовый прайс, и я попробую распознать товары и цены."
+        "Пришли текстовый прайс, и я покажу распознанные товары и характеристики."
     )
 
 
@@ -78,23 +78,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for name, price in products[:10]:
         product = parse_product(name)
-        result.append(f"📱 {name}")
-        result.append(f"💰 Цена: {price}")
-        result.append(
-            f"✅ Модель: {product['model']}"
-            if product['model'] else "⚠️ Модель не определена"
-        )
-        if product['storage_gb'] is not None:
-            result.append(f"💾 Память: {product['storage_gb']} GB")
-        if product['color']:
-            result.append(f"🎨 Цвет: {product['color']}")
-        result.append("")
+        result.append(f"\n📱 {name}")
+        result.append(f"💰 Цена: {price} (валюта не определена)")
+        result.append(f"✅ Модель: {product['model'] or 'Не определена'}")
+        result.append(f"💾 Память: {str(product['storage_gb']) + ' GB' if product['storage_gb'] is not None else 'Не указана'}")
+        result.append(f"🎨 Цвет: {product['color'] or 'Не указан'}")
+        result.append(f"🌍 Регион: {product['region'] or 'Не указан'}")
+        result.append(f"📶 SIM: {product['sim'] or 'Не указана'}")
+        condition = ", ".join(product['condition']) or "Не указано"
+        result.append(f"📦 Состояние: {condition}")
+        for warning in product['warnings']:
+            result.append(f"⚠️ {warning}")
 
     if len(products) > 10:
-        result.append(f"И ещё {len(products) - 10} позиций.")
+        result.append(f"\nИ ещё {len(products) - 10} позиций.")
+    result.append("\n⚠️ Тестовый режим: товары пока не сохраняются.")
 
-    result.append("⚠️ Тестовый режим: товары пока не сохраняются.")
-    await message.reply_text("\n".join(result)[:4000])
+    # Telegram ограничивает длину сообщения; делим ответ по строкам.
+    chunk = ""
+    for line in result:
+        addition = line + "\n"
+        if len(chunk) + len(addition) > 3800:
+            await message.reply_text(chunk)
+            chunk = ""
+        chunk += addition
+    if chunk:
+        await message.reply_text(chunk)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -110,7 +119,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
-
     logger.info("Mobi Price Finder запускается")
     app.run_polling()
 
