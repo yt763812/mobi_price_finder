@@ -20,6 +20,11 @@ COLORS = [
     ("silver", ["silver", "серебристый"]),
     ("burgundy", ["burgundy", "бургунди"]),
     ("glacier", ["glacier", "глейшер", "ледниковый"]),
+    ("starlight", ["starlight", "сияющая звезда"]),
+    ("midnight", ["midnight", "полночь"]),
+    ("graphite", ["graphite", "графит"]),
+    ("gold", ["gold", "золотой", "золотистый"]),
+    ("pink", ["pink", "розовый"]),
     ("purple", ["purple", "фиолетовый", "сиреневый"]),
 ]
 
@@ -38,6 +43,10 @@ REGION_TEXT = [
     ("EU", ["eu", "европейская версия"]),
     ("Canada", ["canada", "ca"]),
     ("Australia", ["australia", "au"]),
+    ("Singapore", ["singapore", "sg"]),
+    ("India", ["india", "in"]),
+    ("South Korea", ["south korea", "kr"]),
+    ("UK", ["united kingdom", "uk"]),
 ]
 
 
@@ -218,6 +227,12 @@ def has_unmodeled_bundle(text):
     ))
 
 
+def detect_sku(text):
+    """Extract only explicitly bracketed product codes; no speculative SKU guesses."""
+    matches = re.findall(r"\[([A-Za-z0-9][A-Za-z0-9 /._-]{3,35})\]", text)
+    return matches[0].strip() if matches else None
+
+
 def parse_product(text):
     model = detect_iphone(text)
     other_brand, other_model = detect_other_model(text) if not model else (None, None)
@@ -230,6 +245,18 @@ def parse_product(text):
     region = detect_region(text)
     sim = detect_sim(text)
     warnings = []
+    # Multiple explicit region codes may indicate conflicting supplier data.
+    normalized = normalize(text)
+    region_mentions = {name for name, aliases in REGION_TEXT
+                       if any(_contains(normalized, alias) for alias in aliases)}
+    if len(region_mentions) > 1:
+        region = None
+        warnings.append("Несколько регионов в одной строке — проверь вручную")
+    if re.search(r"\b(?:\d+\s*(?:gb|гб|tb|тб))\s*[/+]\s*(?:\d+\s*(?:gb|гб|tb|тб))", normalized):
+        # Different capacities may mean RAM/SSD; existing RAM detector handles
+        # supported pairs. Never pretend the split is certain otherwise.
+        if detect_ram(text) is None:
+            warnings.append("Несколько объёмов памяти: уточни RAM и накопитель")
     if model and model.startswith("iPhone ") and region == "USA" and sim in ("dual_sim", "sim_esim"):
         number = int(re.search(r"iPhone (\d+)", model).group(1))
         if number >= 14:
@@ -249,6 +276,7 @@ def parse_product(text):
         "region": region,
         "sim": sim,
         "condition": detect_condition(text),
+        "sku": detect_sku(text),
         "is_accessory": is_accessory(text),
         "warnings": warnings,
     }
