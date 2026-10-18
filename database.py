@@ -59,6 +59,14 @@ def init_db():
                     UNIQUE(supplier_id, signature)
                 )
             """)
+            cur.execute("""CREATE TABLE IF NOT EXISTS supplier_excel_profiles (
+                supplier_id BIGINT NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+                sheet_name TEXT NOT NULL,
+                header_row INTEGER NOT NULL,
+                mapping JSONB NOT NULL,
+                column_fingerprint JSONB NOT NULL,
+                PRIMARY KEY(supplier_id, sheet_name)
+            )""")
             cur.execute("ALTER TABLE offers ADD COLUMN IF NOT EXISTS ram_gb INTEGER")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_offers_model
@@ -346,3 +354,25 @@ def search_offers():
                 ORDER BY s.name, o.original_name
             """)
             return cur.fetchall()
+
+
+def get_excel_profiles(supplier_id):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT sheet_name, header_row, mapping, column_fingerprint FROM supplier_excel_profiles WHERE supplier_id=%s', (supplier_id,))
+            return {row['sheet_name']: row for row in cur.fetchall()}
+
+
+def save_excel_profiles(supplier_id, profiles):
+    """Save mappings only after successful offer import."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for item in profiles:
+                cur.execute("""INSERT INTO supplier_excel_profiles(supplier_id,sheet_name,header_row,mapping,column_fingerprint)
+                    VALUES (%s,%s,%s,%s,%s)
+                    ON CONFLICT(supplier_id,sheet_name) DO UPDATE SET
+                    header_row=excluded.header_row, mapping=excluded.mapping,
+                    column_fingerprint=excluded.column_fingerprint""",
+                    (supplier_id, item['sheet'], item['header_row'],
+                     psycopg.types.json.Jsonb(item['mapping']),
+                     psycopg.types.json.Jsonb(item['fingerprint'])))
