@@ -174,3 +174,71 @@ def extract_xlsx(data, sheet_name, mapping, header_row):
         return rows, skipped
     finally:
         wb.close()
+
+
+def sheet_columns(data, sheet_name, max_columns=40):
+    """Candidate columns and small excerpts for interactive manual selection."""
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name]
+        width = min(ws.max_column or 0, max_columns)
+        head = list(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 12), values_only=True))
+        columns = []
+        for idx in range(width):
+            snippets = []
+            for row in head:
+                val = _clean(row[idx] if idx < len(row) else None)
+                if val and val not in snippets:
+                    snippets.append(val[:35])
+                if len(snippets) == 2:
+                    break
+            columns.append({'index': idx, 'letter': __import__('openpyxl').utils.get_column_letter(idx+1), 'examples': snippets})
+        return columns
+    finally:
+        wb.close()
+
+
+def inspect_mapping(data, sheet_name, mapping, header_row):
+    """Score a proposed mapping using actual priced product rows."""
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name]
+        if ws.max_row and ws.max_row > MAX_ROWS:
+            return {'valid': 0, 'named': 0, 'no_price': 0, 'samples': [], 'truncated': True}
+        if mapping.get('name') is None or mapping.get('price') is None or mapping['name'] == mapping['price']:
+            return {'valid': 0, 'named': 0, 'no_price': 0, 'samples': [], 'truncated': False}
+        valid = named = no_price = 0
+        samples = []
+        for row in ws.iter_rows(min_row=header_row+1, values_only=True):
+            def v(key):
+                i = mapping.get(key)
+                return row[i] if i is not None and i < len(row) else None
+            name = _clean(v('name'))
+            if len(name) < 5 or not re.search('[a-zа-я]', name, re.I):
+                continue
+            named += 1
+            price = _price(v('price'))
+            if price is None:
+                no_price += 1
+                continue
+            valid += 1
+            if len(samples) < 3:
+                samples.append(f'{name[:65]} — {price}')
+        return {'valid': valid, 'named': named, 'no_price': no_price, 'samples': samples, 'truncated': False}
+    finally:
+        wb.close()
+
+
+def sheet_fingerprint(data, sheet_name, header_row, mapping):
+    """A light column signature; do not reuse a profile on a shifted/changed sheet."""
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name]
+        if header_row:
+            row = next(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True), ())
+            return {'width': ws.max_column, 'headers': [_header(x) for x in row[:40]]}
+        # Headerless profile: column alignment cannot be verified by headers;
+        # later inspect_mapping validates that name and price still hold real data.
+        return {'width': ws.max_column, 'headers': []}
+    finally:
+        wb.close()
