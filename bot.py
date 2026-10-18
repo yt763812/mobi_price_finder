@@ -25,17 +25,33 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _user_id(update):
+    user = update.effective_user
+    return str(user.id) if user else ""
+
+
+def is_owner(update):
+    owner_id = os.getenv("OWNER_TELEGRAM_ID", "").strip()
+    return bool(owner_id and owner_id.isdigit() and _user_id(update) == owner_id)
+
+
+def is_manager(update):
+    # One or several IDs, separated by comma, semicolon or whitespace.
+    raw_ids = os.getenv("MANAGER_TELEGRAM_IDS", "")
+    manager_ids = set(re.findall(r"\d+", raw_ids))
+    return bool(_user_id(update) and _user_id(update) in manager_ids)
+
+
 def allowed(update):
-    configured = os.getenv("OWNER_TELEGRAM_ID", "").strip()
-    return configured.isdigit() and update.effective_user and str(update.effective_user.id) == configured
+    return is_owner(update) or is_manager(update)
 
 
 async def authorize(update):
     if allowed(update):
         return True
     await update.effective_message.reply_text(
-        "🔒 Доступ закрыт. Для настройки отправь /myid и добавь свой ID в Railway "
-        "как OWNER_TELEGRAM_ID."
+        "🔒 Доступ закрыт. Отправь /myid и передай Telegram ID владельцу бота "
+        "для добавления в MANAGER_TELEGRAM_IDS."
     )
     return False
 
@@ -99,14 +115,16 @@ def keyboard_suppliers():
     return InlineKeyboardMarkup(buttons)
 
 
-def supplier_manage_keyboard(supplier):
+def supplier_manage_keyboard(supplier, can_delete=True):
     sid = supplier['id']
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Переименовать", callback_data=f"supplier:rename:{sid}")],
-        [InlineKeyboardButton("🗑 Удалить", callback_data=f"supplier:delete:{sid}")],
+    buttons = [[InlineKeyboardButton("✏️ Переименовать", callback_data=f"supplier:rename:{sid}")]]
+    if can_delete:
+        buttons.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"supplier:delete:{sid}")])
+    buttons += [
         [InlineKeyboardButton("⚙️ Валюта и НДС", callback_data=f"supplier:settings:{sid}")],
         [InlineKeyboardButton("👥 Все поставщики", callback_data="nav:suppliers")],
-    ])
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 def supplier_delete_keyboard(sid):
@@ -443,13 +461,16 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Поставщик не найден")
             return
         context.user_data['supplier_id'] = sid
-        await query.message.reply_text(f"✅ Выбран поставщик: {s['name']}", reply_markup=supplier_manage_keyboard(s))
+        await query.message.reply_text(f"✅ Выбран поставщик: {s['name']}", reply_markup=supplier_manage_keyboard(s, is_owner(update)))
         await show_pending(query.message, context)
     elif action.startswith('supplier:'):
         parts = action.split(':')
         if len(parts) != 3 or not parts[2].isdigit():
             return
         operation, sid = parts[1], int(parts[2])
+        if operation in ('delete', 'confirm_delete') and not is_owner(update):
+            await query.message.reply_text('🔒 Удалять поставщиков может только владелец бота.')
+            return
         s = get_supplier(sid)
         if not s:
             await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
@@ -467,14 +488,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif operation == 'cancel_rename':
             if context.user_data.get('await_rename_id') == sid:
                 context.user_data.pop('await_rename_id', None)
-            await query.message.reply_text('Изменение названия отменено.', reply_markup=supplier_manage_keyboard(s))
+            await query.message.reply_text('Изменение названия отменено.', reply_markup=supplier_manage_keyboard(s, is_owner(update)))
         elif operation == 'delete':
             await query.message.reply_text(
                 f"⚠️ Удалить «{s['name']}» и ВСЕ его сохранённые товары? "
                 "Это действие нельзя отменить.", reply_markup=supplier_delete_keyboard(sid)
             )
         elif operation == 'cancel_delete':
-            await query.message.reply_text('Удаление отменено.', reply_markup=supplier_manage_keyboard(s))
+            await query.message.reply_text('Удаление отменено.', reply_markup=supplier_manage_keyboard(s, is_owner(update)))
         elif operation == 'confirm_delete':
             deleted = delete_supplier(sid)
             if deleted:
