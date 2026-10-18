@@ -502,6 +502,10 @@ def _search_normalize(text):
 def _offer_matches(query, requested, offer):
     original = offer['original_name']
     found = parse_product(original)
+    # A compatible phone model inside an accessory name is not the phone itself.
+    # An explicit accessory query must not return a bare phone either.
+    if requested['is_accessory'] != found['is_accessory']:
+        return False
     # Parse from original name even when older database entries have no model.
     query_model = requested.get('model')
     found_model = found.get('model') or offer.get('model')
@@ -540,7 +544,8 @@ COLOR_LABELS = {'black': 'Black', 'white': 'White', 'blue': 'Blue',
                 'deep_blue': 'Deep Blue', 'sky_blue': 'Sky Blue',
                 'silver': 'Silver', 'green': 'Green', 'orange': 'Orange',
                 'purple': 'Purple', 'cosmic_orange': 'Cosmic Orange',
-                'natural_titanium': 'Natural Titanium', 'burgundy': 'Burgundy'}
+                'natural_titanium': 'Natural Titanium', 'burgundy': 'Burgundy',
+                'glacier': 'Glacier'}
 
 
 def format_offer(offer, index):
@@ -550,7 +555,9 @@ def format_offer(offer, index):
     memory = get('storage_gb')
     memory_label = f'{memory} GB' if memory is not None else 'Не указан'
     condition = parsed.get('condition') or offer.get('condition_tags') or []
-    condition_label = ', '.join(condition) if condition else 'Не указано'
+    condition_labels = {'activated': 'Активирован', 'sealed': 'Запечатан',
+                        'refurbished': 'Восстановлен', 'used': 'Б/у'}
+    condition_label = ', '.join(condition_labels.get(c, c) for c in condition) if condition else 'Не указано'
     vat = {'with_vat': 'с НДС', 'without_vat': 'без НДС',
            'unknown': 'НДС не указан'}.get(offer.get('tax_status'), 'НДС не указан')
     return (f"{index}. 🏪 {offer['supplier_name']}\n"
