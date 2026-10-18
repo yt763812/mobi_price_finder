@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from openpyxl import load_workbook
 
 NAME_HEADERS = ('модель', 'наименование', 'название товара', 'товар', 'product', 'model', 'item', 'description')
-PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price')
+PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб')
 BRAND_HEADERS = ('бренд', 'brand', 'производитель')
 CATEGORY_HEADERS = ('категория', 'category')
 BAD_PRICE = ('итого', 'total', 'сумма', 'розница', 'retail', 'ррц')
@@ -19,6 +19,15 @@ def _clean(value):
 
 def _header(value):
     return re.sub(r'\s+', ' ', _clean(value).casefold())
+
+
+def _preferred_price(row):
+    # Explicit USD and generic price columns take priority over RUB totals.
+    indices = _indices(row, PRICE_HEADERS)
+    return sorted(indices, key=lambda i: (
+        0 if ('usd' in _header(row[i]) or '$' in _header(row[i])) else
+        2 if ('rub' in _header(row[i]) or 'руб' in _header(row[i])) else 1, i))
+
 
 
 def _indices(row, aliases):
@@ -50,7 +59,7 @@ def inspect_xlsx(data):
             ambiguous = False
             for row_num, row in enumerate(ws.iter_rows(min_row=1, max_row=25, values_only=True), 1):
                 names = _indices(row, NAME_HEADERS)
-                prices = _indices(row, PRICE_HEADERS)
+                prices = _preferred_price(row)
                 brands = _indices(row, BRAND_HEADERS)
                 categories = _indices(row, CATEGORY_HEADERS)
                 if names and prices:
@@ -58,7 +67,8 @@ def inspect_xlsx(data):
                     mapping = {'name': names[0], 'price': prices[0],
                                'brand': brands[0] if brands else None,
                                'category': categories[0] if categories else None}
-                    ambiguous = len(names) > 1 or len(prices) > 1
+                    price_header = _clean(row[prices[0]])
+                    ambiguous = len(names) > 1 or (len(prices) > 1 and _header(row[prices[0]]) == _header(row[prices[1]]))
                     break
             if mapping is None:
                 sheets.append({'sheet': ws.title, 'status': 'unknown'})
@@ -82,6 +92,7 @@ def inspect_xlsx(data):
                     samples.append(f'{brand + " " if brand else ""}{name[:85]} — {price}')
             sheets.append({'sheet': ws.title, 'status': 'preview', 'header_row': header_row,
                            'mapping': mapping, 'ambiguous': ambiguous,
+                           'price_header': price_header,
                            'named': count, 'valid': valid, 'no_price': no_price,
                            'samples': samples,
                            'truncated': bool(ws.max_row and ws.max_row > MAX_ROWS)})
