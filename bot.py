@@ -3,6 +3,8 @@ import html
 import logging
 import os
 import re
+import hashlib
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -11,10 +13,10 @@ from telegram.ext import (
 )
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, init_db, list_suppliers,
-    save_price_list, update_supplier_settings,
+    save_price_list, save_excel_rows, update_supplier_settings,
 )
 from product_parser import parse_product
-from excel_importer import inspect_xlsx, MAX_FILE_BYTES
+from excel_importer import inspect_xlsx, extract_xlsx, MAX_FILE_BYTES
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -310,6 +312,36 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = update_supplier_settings(sid, **({'currency': value} if kind == 'setcur' else {'tax_status': value}))
         await query.message.reply_text(f"✅ Настройки {s['name']}: {s['currency']}, {s['tax_status']}")
         await show_pending(query.message, context)
+    elif action == 'excel:cancel':
+        context.user_data.pop('excel_pending', None)
+        await query.message.reply_text('Excel-импорт отменён. Данные не сохранены.')
+    elif action == 'excel:save':
+        staged = context.user_data.pop('excel_pending', None)
+        if not staged or time.time() > staged['expires']:
+            await query.message.reply_text('Подтверждение истекло. Отправь Excel ещё раз.')
+            return
+        sid = context.user_data.get('supplier_id')
+        if sid != staged['supplier_id']:
+            await query.message.reply_text('Поставщик изменился. Отправь Excel ещё раз.')
+            return
+        await query.message.reply_text('⏳ Сохраняю Excel в PostgreSQL. Подожди...')
+        try:
+            # Re-parse the exact staged file; no Telegram re-download required.
+            extracted, skipped = extract_xlsx(staged['data'], staged['sheet'], staged['mapping'], staged['header_row'])
+            parsed = [(parse_product(name), price) for name, price in extracted]
+            report = save_excel_rows(sid, parsed, staged['currency'], staged['tax_status'])
+        except Exception:
+            logger.exception('Excel save failed')
+            await query.message.reply_text('❌ Импорт не выполнен. Проверь Railway Logs. Повтори отправку файла.')
+            return
+        await query.message.reply_text(
+            f"✅ Excel сохранён!\nКонфигураций: {report['saved']}\n"
+            f"Нераспознанных строк (сохранены по исходному названию): {report['unrecognized_rows']}\n"
+            f"Дубли внутри файла: {report['duplicates']}\n"
+            f"Строк без цены: {skipped}\n"
+            'Отсутствующие в файле старые предложения не удалены.\n'
+            f"Валюта: {staged['currency']}, НДС: {staged['tax_status']}."
+        )
     elif action == 'import:cancel':
         context.user_data.pop('pending', None)
         await query.message.reply_text("Прайс отменён. В базу ничего не записано.")
@@ -421,8 +453,30 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sheet['truncated']:
             lines.append('⚠️ Предпросмотр ограничен 30 000 строками.')
         lines.extend('• ' + example for example in sheet['samples'])
-    lines.append('\n🔒 Это только анализ файла. В PostgreSQL ничего не записано.')
-    await update.effective_message.reply_text('\n'.join(lines)[:4000])
+    lines.append('\n🔒 Предпросмотр: пока ничего не записано.')
+    safe = (supplier and supplier['currency'] in ('USD','BYN','RUB','EUR')
+            and supplier['tax_status'] in ('with_vat','without_vat')
+            and len(result) == 1 and result[0]['status'] == 'preview'
+            and not result[0]['ambiguous'] and not result[0]['truncated']
+            and result[0]['valid'] > 0)
+    context.user_data.pop('excel_pending', None)
+    keyboard = None
+    if safe:
+        sheet = result[0]
+        context.user_data['excel_pending'] = {
+            'data': payload, 'sheet': sheet['sheet'], 'mapping': sheet['mapping'],
+            'header_row': sheet['header_row'], 'supplier_id': supplier['id'],
+            'currency': supplier['currency'], 'tax_status': supplier['tax_status'],
+            'expires': time.time() + 900,
+        }
+        lines.append('⚠️ Подтверди сохранение. Нераспознанные товары будут сохранены по исходному названию, но пока не участвуют в поиске по модели.')
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton('✅ Сохранить Excel', callback_data='excel:save')],
+            [InlineKeyboardButton('❌ Отменить', callback_data='excel:cancel')],
+        ])
+    else:
+        lines.append('⚠️ Импорт заблокирован: проверь поставщика, валюту, НДС, листы и неоднозначные столбцы.')
+    await update.effective_message.reply_text('\n'.join(lines)[:4000], reply_markup=keyboard)
 
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
