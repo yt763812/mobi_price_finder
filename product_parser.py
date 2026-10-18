@@ -55,11 +55,17 @@ def detect_color(text):
 def detect_storage(text):
     t = normalize(text)
     # Формат 8GB/256GB: первый показатель обычно RAM, второй — накопитель.
+    pair = re.search(r"(?<!\d)(?:4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*/\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
+    if pair:
+        return int(pair.group(1))
     found = re.findall(r"(?<!\w)(\d{1,4})\s*(tb|тб|gb|гб|g)(?!\w)", t)
     if found:
         amount, unit = found[-1]
         size = int(amount) * (1024 if unit in ("tb", "тб") else 1)
         return size
+    pair = re.search(r"(?<!\d)(?:4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*/\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
+    if pair:
+        return int(pair.group(1))
     # В некоторых прайсах единица измерения отсутствует.
     match = re.search(r"(?<!\d)(128|256|512|1024)(?!\d)", t)
     return int(match.group(1)) if match else None
@@ -119,12 +125,56 @@ def detect_condition(text):
     return markers
 
 
+
+
+# Универсальное определение моделей. Более конкретные шаблоны идут первыми.
+DEVICE_PATTERNS = [
+    ("Samsung", r"(?:samsung\s*)?(?:galaxy\s*)?(s(?:2[0-9]|3[0-9])\s*(?:ultra|plus|\+|fe)?)", "Galaxy"),
+    ("Samsung", r"(?:samsung\s*)?(?:galaxy\s*)?(a[0-9]{2}\s*(?:5g)?)", "Galaxy"),
+    ("Samsung", r"(?:samsung\s*)?(?:galaxy\s*)?(z\s*(?:fold|flip)\s*[0-9]+)", "Galaxy"),
+    ("Google", r"(?:google\s*)?(pixel\s*[0-9]+(?:\s*(?:pro\s*xl|pro|xl|a))?)", ""),
+    ("Xiaomi", r"(?:xiaomi\s*)?((?:redmi\s*)?note\s*[0-9]+\s*(?:pro\s*\+?|pro|plus|5g)?)", ""),
+    ("Xiaomi", r"(?:xiaomi\s*)([0-9]{1,2}\s*(?:ultra|pro|t\s*pro|t)?)", ""),
+    ("POCO", r"(?:poco\s*)([xfm][0-9]+\s*(?:pro|ultra)?)", ""),
+    ("HONOR", r"(?:honor\s*)(magic\s*[0-9]+\s*(?:pro|lite|ultimate)?)", ""),
+    ("HONOR", r"(?:honor\s*)([0-9]{2,3}\s*(?:pro|lite)?)", ""),
+]
+
+def detect_other_model(text):
+    t = normalize(text)
+    for brand, pattern, prefix in DEVICE_PATTERNS:
+        match = re.search(r"(?<!\w)" + pattern + r"(?!\w)", t, re.I)
+        if match:
+            # Не распознаём сокращения вроде S26 без названия бренда:
+            # иначе можно ошибочно принять артикул за телефон.
+            if brand == "Samsung" and not re.search(r"\b(samsung|galaxy|самсунг)\b", t):
+                continue
+            if brand == "Google" and not re.search(r"\b(google|pixel|гугл)\b", t):
+                continue
+            if brand == "Xiaomi" and not re.search(r"\b(xiaomi|redmi|сяоми|ксиаоми)\b", t):
+                continue
+            name = re.sub(r"\s+", " ", match.group(1).upper()).strip()
+            return brand, (prefix + " " + name).strip()
+    return None, None
+
+def detect_ram(text):
+    t = normalize(text)
+    pair = re.search(r"(?<!\d)(4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*/\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
+    if pair:
+        return int(pair.group(1))
+    match = re.search(r"(?<!\w)(?:ram|озу|оперативная память)\s*[:\-]?\s*(4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?(?!\w)", t)
+    return int(match.group(1)) if match else None
+
+
 def parse_product(text):
     model = detect_iphone(text)
+    other_brand, other_model = detect_other_model(text) if not model else (None, None)
+    if not model:
+        model = other_model
     region = detect_region(text)
     sim = detect_sim(text)
     warnings = []
-    if model and region == "USA" and sim in ("dual_sim", "sim_esim"):
+    if model and model.startswith("iPhone ") and region == "USA" and sim in ("dual_sim", "sim_esim"):
         number = int(re.search(r"iPhone (\d+)", model).group(1))
         if number >= 14:
             warnings.append("Возможное противоречие: USA и физическая SIM — проверить версию iPhone")
@@ -135,9 +185,10 @@ def parse_product(text):
         warnings.append("Флаг и текстовый регион расходятся — уточнить")
     return {
         "original": text,
-        "brand": "Apple" if model else None,
+        "brand": "Apple" if detect_iphone(text) else other_brand,
         "model": model,
         "storage_gb": detect_storage(text),
+        "ram_gb": detect_ram(text),
         "color": detect_color(text),
         "region": region,
         "sim": sim,
