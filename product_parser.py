@@ -19,6 +19,7 @@ COLORS = [
     ("orange", ["orange", "оранжевый"]),
     ("silver", ["silver", "серебристый"]),
     ("burgundy", ["burgundy", "бургунди"]),
+    ("glacier", ["glacier", "глейшер", "ледниковый"]),
     ("purple", ["purple", "фиолетовый", "сиреневый"]),
 ]
 
@@ -111,10 +112,25 @@ def detect_sim(text):
     return None
 
 
+# Product-role identification: compatibility mentions must not turn a case into a phone.
+# Only explicit accessory nouns are used; unknown products remain searchable.
+ACCESSORY_PATTERNS = [
+    r"(?<!\w)(?:case|cases|cover|covers|чехол|чехлы|накладка|бампер)(?!\w)",
+    r"(?<!\w)(?:screen\s*protector|glass\s*protector|tempered\s*glass|защитное\s*стекло|пленка|плёнка)(?!\w)",
+    r"(?<!\w)(?:charger|charging\s*adapter|power\s*adapter|зарядное\s*устройство|зарядка|адаптер\s*питания)(?!\w)",
+    r"(?<!\w)(?:phone\s*holder|держатель\s*для\s*телефона|кабель|cable)(?!\w)",
+]
+
+
+def is_accessory(text):
+    t = normalize(text)
+    return any(re.search(pattern, t) for pattern in ACCESSORY_PATTERNS)
+
+
 def detect_condition(text):
     t = normalize(text)
     markers = []
-    if re.search(r"\b(актив|активирован|activated)\b", t):
+    if re.search(r"\b(актив|активирован|activated|activ)\b", t):
         markers.append("activated")
     if re.search(r"\b(запечатан|запечатанный|sealed)\b", t):
         markers.append("sealed")
@@ -233,5 +249,6 @@ def parse_product(text):
         "region": region,
         "sim": sim,
         "condition": detect_condition(text),
+        "is_accessory": is_accessory(text),
         "warnings": warnings,
     }
