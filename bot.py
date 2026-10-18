@@ -412,7 +412,7 @@ async def run_search(message, query_text):
             continue
         mismatch = False
         unknown = []
-        for field, label in (("color", "цвет"), ("region", "регион"),
+        for field, label in (("ram_gb", "RAM"), ("color", "цвет"), ("region", "регион"),
                              ("sim", "SIM")):
             desired = requested.get(field)
             if desired is None:
