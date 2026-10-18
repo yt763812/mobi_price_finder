@@ -3,6 +3,7 @@ import io
 import re
 from decimal import Decimal, InvalidOperation
 from openpyxl import load_workbook
+from product_parser import parse_product
 
 NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название товара', 'товар', 'product', 'model', 'item', 'description')
 PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб')
@@ -115,6 +116,8 @@ def inspect_xlsx(data):
                 continue
             count = valid = no_price = 0
             samples = []
+            parsed_samples = []
+            uncertain = 0
             for row in ws.iter_rows(min_row=header_row + 1, max_row=min(ws.max_row or MAX_ROWS, MAX_ROWS), values_only=True):
                 def val(idx):
                     return row[idx] if idx is not None and idx < len(row) else None
@@ -128,13 +131,30 @@ def inspect_xlsx(data):
                     continue
                 valid += 1
                 brand = _clean(val(mapping['brand']))
+                full_name = (brand + " " + name).strip() if brand else name
+                for field in ("color", "region"):
+                    extra = _clean(val(mapping.get(field)))
+                    if extra and extra.casefold() not in full_name.casefold():
+                        full_name += " " + extra
                 if len(samples) < 4:
-                    samples.append(f'{brand + " " if brand else ""}{name[:85]} — {price}')
+                    samples.append(f'{full_name[:85]} — {price}')
+                    parsed = parse_product(full_name)
+                    parsed_samples.append({
+                        'model': parsed.get('model') or 'По исходному названию',
+                        'storage': parsed.get('storage_gb'),
+                        'color': parsed.get('color'),
+                        'region': parsed.get('region'),
+                        'sim': parsed.get('sim'),
+                        'warnings': parsed.get('warnings', []),
+                    })
+                if parse_product(full_name).get('warnings'):
+                    uncertain += 1
             sheets.append({'sheet': ws.title, 'status': 'preview', 'header_row': header_row,
                            'mapping': mapping, 'ambiguous': ambiguous,
                            'price_header': price_header,
                            'named': count, 'valid': valid, 'no_price': no_price,
-                           'samples': samples,
+                           'samples': samples, 'parsed_samples': parsed_samples,
+                           'uncertain': uncertain,
                            'truncated': bool(ws.max_row and ws.max_row > MAX_ROWS)})
         return sheets
     finally:
