@@ -393,7 +393,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text('⏳ Сохраняю Excel в PostgreSQL. Подожди...')
         try:
             # Re-parse the exact staged file; no Telegram re-download required.
-            extracted, skipped = extract_xlsx(staged['data'], staged['sheet'], staged['mapping'], staged['header_row'])
+            extracted, skipped = [], 0
+            for selected in staged['sheets']:
+                batch, missing = extract_xlsx(staged['data'], selected['sheet'], selected['mapping'], selected['header_row'])
+                extracted.extend(batch)
+                skipped += missing
             parsed = [(parse_product(name), price) for name, price in extracted]
             report = save_excel_rows(sid, parsed, staged['currency'], staged['tax_status'])
         except Exception:
@@ -543,19 +547,20 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append('\n🔒 Предпросмотр: пока ничего не записано.')
     safe = (supplier and supplier['currency'] in ('USD','BYN','RUB','EUR')
             and supplier['tax_status'] in ('with_vat','without_vat')
-            and len([x for x in result if x['status'] == 'preview']) == 1
+            and any(x['status'] == 'preview' and x['valid'] > 0 for x in result)
             and not any(x['status'] == 'preview' and (x['ambiguous'] or x['truncated']) for x in result)
-            and next((x['valid'] for x in result if x['status'] == 'preview'), 0) > 0)
+            and not any(x['status'] == 'unknown' and x['sheet'] for x in result))
     context.user_data.pop('excel_pending', None)
     keyboard = None
     if safe:
-        sheet = next(x for x in result if x['status'] == 'preview')
+        selected_sheets = [dict(sheet=x['sheet'], mapping=x['mapping'], header_row=x['header_row'])
+                           for x in result if x['status'] == 'preview' and x['valid'] > 0]
         context.user_data['excel_pending'] = {
-            'data': payload, 'sheet': sheet['sheet'], 'mapping': sheet['mapping'],
-            'header_row': sheet['header_row'], 'supplier_id': supplier['id'],
+            'data': payload, 'sheets': selected_sheets, 'supplier_id': supplier['id'],
             'currency': supplier['currency'], 'tax_status': supplier['tax_status'],
             'expires': time.time() + 900,
         }
+        lines.append(f'✅ К сохранению: {sum(x["valid"] for x in result if x["status"] == "preview")} строк из {len(selected_sheets)} лист(ов).')
         lines.append('⚠️ Подтверди сохранение. Нераспознанные товары сохраняются и доступны для поиска по исходному названию.')
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton('✅ Сохранить Excel', callback_data='excel:save')],
