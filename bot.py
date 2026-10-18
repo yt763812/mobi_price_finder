@@ -14,9 +14,11 @@ from telegram.ext import (
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
+    get_excel_profiles, save_excel_profiles,
 )
 from product_parser import parse_product
-from excel_importer import inspect_xlsx, extract_xlsx, MAX_FILE_BYTES
+from excel_importer import (inspect_xlsx, extract_xlsx, MAX_FILE_BYTES,
+                            sheet_columns, inspect_mapping, sheet_fingerprint)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -260,6 +262,125 @@ async def show_pending(message, context):
     )
 
 
+
+EXCEL_FIELDS = ('name', 'price', 'brand', 'color', 'region', 'category')
+EXCEL_FIELD_NAMES = {'name': 'Название товара', 'price': 'Цена', 'brand': 'Бренд',
+                     'color': 'Цвет', 'region': 'Регион', 'category': 'Категория'}
+
+
+def excel_menu(stage):
+    buttons = []
+    for i, item in enumerate(stage['sheets']):
+        mark = '✅' if item.get('enabled') else '⏭' if item.get('skipped') else '⚠️'
+        buttons.append([InlineKeyboardButton(f'{mark} {item["sheet"][:40]}', callback_data=f'xm:sheet:{i}')])
+    buttons.append([InlineKeyboardButton('✅ Предпросмотр и сохранение', callback_data='xm:review')])
+    buttons.append([InlineKeyboardButton('❌ Отмена', callback_data='excel:cancel')])
+    return InlineKeyboardMarkup(buttons)
+
+
+def excel_sheet_menu(stage, index):
+    item = stage['sheets'][index]
+    mapping = item.get('mapping') or {}
+    def letter(field):
+        idx = mapping.get(field)
+        return '-' if idx is None else __import__('openpyxl').utils.get_column_letter(idx+1)
+    buttons = [[InlineKeyboardButton(f'Строка заголовков: {item.get("header_row", 0)}', callback_data=f'xm:head:{index}')]]
+    for field in EXCEL_FIELDS:
+        buttons.append([InlineKeyboardButton(f'{EXCEL_FIELD_NAMES[field]}: {letter(field)}', callback_data=f'xm:field:{index}:{field}')])
+    buttons.extend([[InlineKeyboardButton('✅ Использовать лист', callback_data=f'xm:use:{index}')],
+                    [InlineKeyboardButton('⏭ Пропустить лист', callback_data=f'xm:skip:{index}')],
+                    [InlineKeyboardButton('↩️ К списку листов', callback_data='xm:list')]])
+    return InlineKeyboardMarkup(buttons)
+
+
+def staged_excel_ready(stage):
+    return all(item.get('enabled') or item.get('skipped') for item in stage['sheets']) and any(
+        item.get('enabled') for item in stage['sheets'])
+
+
+async def excel_review(message, context):
+    stage = context.user_data.get('excel_pending')
+    if not stage or stage['expires'] < time.time():
+        await message.reply_text('Настройка истекла. Пришли Excel ещё раз.')
+        return
+    lines = ['📊 Excel — проверка перед импортом', 'Поставщик: '+stage['supplier_name']]
+    for item in stage['sheets']:
+        if item.get('enabled'):
+            lines.append(f'✅ {item["sheet"]}: {item["valid"]} строк')
+            lines.extend('• '+v for v in item.get('samples', [])[:2])
+        elif item.get('skipped'):
+            lines.append('⏭ '+item['sheet']+' — пропущен')
+        else:
+            lines.append('⚠️ '+item['sheet']+' — требует настройки')
+    lines.append('Никакие товары ещё не сохранены. При подтверждении прежний прайс выбранного поставщика будет заменён.')
+    keyboard = [[InlineKeyboardButton('🛠 Настроить листы', callback_data='xm:list')]]
+    if staged_excel_ready(stage):
+        keyboard.insert(0, [InlineKeyboardButton('✅ Сохранить прайс', callback_data='excel:save')])
+    keyboard.append([InlineKeyboardButton('❌ Отменить', callback_data='excel:cancel')])
+    await message.reply_text('\n'.join(lines)[:4000], reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def excel_manual_callback(query, context, action):
+    stage = context.user_data.get('excel_pending')
+    if not stage or stage['expires'] < time.time():
+        await query.message.reply_text('Настройка Excel истекла. Загрузи файл ещё раз.')
+        return
+    parts = action.split(':')
+    op = parts[1]
+    if op == 'review':
+        await excel_review(query.message, context)
+        return
+    if op == 'list':
+        await query.message.reply_text('Выбери лист для настройки. ✅ — включён, ⏭ — пропущен, ⚠️ — требует настройки.', reply_markup=excel_menu(stage))
+        return
+    try:
+        idx = int(parts[2]); item = stage['sheets'][idx]
+    except (IndexError, ValueError):
+        return
+    if op == 'sheet':
+        await query.message.reply_text(f'Лист «{item["sheet"]}». Выбери заголовки и колонки, затем нажми «Использовать лист».', reply_markup=excel_sheet_menu(stage, idx))
+    elif op == 'head':
+        choices = [[InlineKeyboardButton('Без заголовков (0)', callback_data=f'xm:sethead:{idx}:0')]]
+        choices += [[InlineKeyboardButton(f'Строка {n}', callback_data=f'xm:sethead:{idx}:{n}')] for n in range(1, 21)]
+        await query.message.reply_text('Выбери номер строки с заголовками. 0 — данные начинаются с первой строки.', reply_markup=InlineKeyboardMarkup(choices))
+    elif op == 'sethead':
+        item['header_row'] = int(parts[3]); item['enabled'] = False; item['skipped'] = False
+        await query.message.reply_text('Строка установлена.', reply_markup=excel_sheet_menu(stage, idx))
+    elif op == 'field':
+        field = parts[3]
+        if field not in EXCEL_FIELDS:
+            return
+        columns = sheet_columns(stage['data'], item['sheet'])
+        choices = []
+        if field not in ('name', 'price'):
+            choices.append([InlineKeyboardButton('Не использовать', callback_data=f'xm:setcol:{idx}:{field}:x')])
+        for col in columns:
+            descr = ' / '.join(col['examples'])[:37] or '(пусто в начале)'
+            choices.append([InlineKeyboardButton(f'{col["letter"]} — {descr}', callback_data=f'xm:setcol:{idx}:{field}:{col["index"]}')])
+        await query.message.reply_text('Выбери столбец: '+EXCEL_FIELD_NAMES[field], reply_markup=InlineKeyboardMarkup(choices))
+    elif op == 'setcol':
+        field, chosen = parts[3], parts[4]
+        if field not in EXCEL_FIELDS:
+            return
+        item.setdefault('mapping', {k: None for k in EXCEL_FIELDS})[field] = None if chosen == 'x' else int(chosen)
+        item['enabled'] = False; item['skipped'] = False
+        await query.message.reply_text('Столбец выбран.', reply_markup=excel_sheet_menu(stage, idx))
+    elif op == 'skip':
+        item['enabled'] = False; item['skipped'] = True
+        await query.message.reply_text('Лист пропущен.', reply_markup=excel_menu(stage))
+    elif op == 'use':
+        mapping = item.get('mapping') or {}
+        if mapping.get('name') is None or mapping.get('price') is None or mapping['name'] == mapping['price']:
+            await query.message.reply_text('❌ Укажи разные столбцы товара и цены.')
+            return
+        info = inspect_mapping(stage['data'], item['sheet'], mapping, item.get('header_row', 0))
+        if not info['valid'] or info['truncated']:
+            await query.message.reply_text('❌ Нет строк с распознанными названиями и положительными ценами либо лист слишком велик. Исправь столбцы.')
+            return
+        item.update(info); item['enabled'] = True; item['skipped'] = False
+        await query.message.reply_text(f'✅ {item["sheet"]}: найдено {info["valid"]} предложений.', reply_markup=excel_menu(stage))
+
+
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not allowed(update):
@@ -378,28 +499,37 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = update_supplier_settings(sid, **({'currency': value} if kind == 'setcur' else {'tax_status': value}))
         await query.message.reply_text(f"✅ Настройки {s['name']}: {s['currency']}, {s['tax_status']}")
         await show_pending(query.message, context)
+    elif action.startswith('xm:'):
+        await excel_manual_callback(query, context, action)
     elif action == 'excel:cancel':
         context.user_data.pop('excel_pending', None)
         await query.message.reply_text('Excel-импорт отменён. Данные не сохранены.')
     elif action == 'excel:save':
-        staged = context.user_data.pop('excel_pending', None)
+        staged = context.user_data.get('excel_pending')
         if not staged or time.time() > staged['expires']:
             await query.message.reply_text('Подтверждение истекло. Отправь Excel ещё раз.')
             return
         sid = context.user_data.get('supplier_id')
-        if sid != staged['supplier_id']:
+        if sid != staged['supplier_id'] or not staged_excel_ready(staged):
             await query.message.reply_text('Поставщик изменился. Отправь Excel ещё раз.')
             return
         await query.message.reply_text('⏳ Сохраняю Excel в PostgreSQL. Подожди...')
         try:
             # Re-parse the exact staged file; no Telegram re-download required.
             extracted, skipped = [], 0
-            for selected in staged['sheets']:
+            selected_items = [it for it in staged['sheets'] if it.get('enabled')]
+            for selected in selected_items:
                 batch, missing = extract_xlsx(staged['data'], selected['sheet'], selected['mapping'], selected['header_row'])
                 extracted.extend(batch)
                 skipped += missing
             parsed = [(parse_product(name), price) for name, price in extracted]
             report = save_excel_rows(sid, parsed, staged['currency'], staged['tax_status'])
+            context.user_data.pop('excel_pending', None)
+            try:
+                profiles = [{**it, 'fingerprint': sheet_fingerprint(staged['data'], it['sheet'], it['header_row'], it['mapping'])} for it in selected_items]
+                save_excel_profiles(sid, profiles)
+            except Exception:
+                logger.exception('Excel profiles save failed')
         except Exception:
             logger.exception('Excel save failed')
             await query.message.reply_text('❌ Импорт не выполнен. Проверь Railway Logs. Повтори отправку файла.')
@@ -507,68 +637,64 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     doc = update.effective_message.document
     if not doc or not doc.file_name.lower().endswith('.xlsx'):
-        await update.effective_message.reply_text('Пока поддерживаются только Excel-файлы .xlsx.')
+        await update.effective_message.reply_text('Поддерживаются файлы .xlsx.')
         return
     if doc.file_size and doc.file_size > MAX_FILE_BYTES:
-        await update.effective_message.reply_text('Файл больше 12 МБ, импорт пока недоступен.')
+        await update.effective_message.reply_text('Файл больше 12 МБ.')
+        return
+    sid = context.user_data.get('supplier_id')
+    supplier = get_supplier(sid) if sid else None
+    if not supplier:
+        await update.effective_message.reply_text('Сначала выбери поставщика через /suppliers.')
+        return
+    if supplier['currency'] not in ('USD', 'BYN', 'RUB', 'EUR') or supplier['tax_status'] not in ('with_vat', 'without_vat'):
+        await update.effective_message.reply_text('Сначала укажи валюту и НДС в /settings.')
         return
     try:
         tg_file = await doc.get_file()
         payload = bytes(await tg_file.download_as_bytearray())
-        result = inspect_xlsx(payload)
+        detected = inspect_xlsx(payload)
+        profiles = get_excel_profiles(sid)
+        sheets = []
+        for result in detected:
+            name = result['sheet']
+            if result['status'] == 'preview' and result.get('valid', 0) > 0 and not result.get('ambiguous') and not result.get('truncated'):
+                item = dict(result, enabled=True, skipped=False)
+            else:
+                item = {'sheet': name, 'mapping': {k: None for k in EXCEL_FIELDS},
+                        'header_row': 0, 'enabled': False, 'skipped': False}
+                old = profiles.get(name)
+                if old:
+                    oldmap, oldhead = old['mapping'], old['header_row']
+                    fingerprint = sheet_fingerprint(payload, name, oldhead, oldmap)
+                    if fingerprint == old['column_fingerprint']:
+                        check = inspect_mapping(payload, name, oldmap, oldhead)
+                        if check['valid'] and not check['truncated']:
+                            item.update(check)
+                            item.update(mapping=oldmap, header_row=oldhead, enabled=True)
+            # Reuse supplier's validated column choice if headers are unchanged.
+            old = profiles.get(name)
+            if old:
+                oldmap, oldhead = old['mapping'], old['header_row']
+                if sheet_fingerprint(payload, name, oldhead, oldmap) == old['column_fingerprint']:
+                    check = inspect_mapping(payload, name, oldmap, oldhead)
+                    if check['valid'] and not check['truncated']:
+                        item.update(check, mapping=oldmap, header_row=oldhead, enabled=True, skipped=False)
+            sheets.append(item)
+        if not sheets:
+            await update.effective_message.reply_text('В файле нет доступных листов.')
+            return
     except Exception as exc:
-        logger.exception('Excel preview failed')
-        await update.effective_message.reply_text('Не удалось прочитать Excel: ' + str(exc)[:160])
+        logger.exception('Excel inspection failed')
+        await update.effective_message.reply_text('Ошибка чтения Excel: '+str(exc)[:180])
         return
-    supplier_id = context.user_data.get('supplier_id')
-    supplier = get_supplier(supplier_id) if supplier_id else None
-    lines = ['📊 Предпросмотр Excel — БЕЗ СОХРАНЕНИЯ',
-             f'Файл: {doc.file_name}',
-             f'Поставщик: {supplier["name"] if supplier else "не выбран"}']
-    if supplier:
-        lines.append(f'Настройки поставщика: {supplier["currency"]}, {supplier["tax_status"]}')
-    else:
-        lines.append('Выбери поставщика через /suppliers перед будущим импортом.')
-    for sheet in result[:8]:
-        lines.append('\nЛист: ' + sheet['sheet'])
-        if sheet['status'] == 'unknown':
-            lines.append('⚠️ Не удалось уверенно найти столбцы названия и цены. Нужен ручной выбор.')
-            continue
-        mapping = sheet['mapping']
-        col = lambda idx: '-' if idx is None else __import__('openpyxl').utils.get_column_letter(idx + 1)
-        lines.append(f'Строка заголовков: {sheet["header_row"]}; товар: {col(mapping["name"])}; цена: {col(mapping["price"])}; бренд: {col(mapping["brand"])}; категория: {col(mapping["category"])}')
-        lines.append(f'Обнаруженная колонка цены: {sheet.get("price_header", "")}')
-        lines.append(f'С названиями: {sheet["named"]}; с положительной ценой: {sheet["valid"]}; без цены: {sheet["no_price"]}')
-        if sheet['ambiguous']:
-            lines.append('⚠️ Найдено несколько подходящих столбцов — перед сохранением потребуется выбор.')
-        if sheet['truncated']:
-            lines.append('⚠️ Предпросмотр ограничен 30 000 строками.')
-        lines.extend('• ' + example for example in sheet['samples'])
-    lines.append('\n🔒 Предпросмотр: пока ничего не записано.')
-    safe = (supplier and supplier['currency'] in ('USD','BYN','RUB','EUR')
-            and supplier['tax_status'] in ('with_vat','without_vat')
-            and any(x['status'] == 'preview' and x['valid'] > 0 for x in result)
-            and not any(x['status'] == 'preview' and (x['ambiguous'] or x['truncated']) for x in result)
-            and not any(x['status'] == 'unknown' and x['sheet'] for x in result))
-    context.user_data.pop('excel_pending', None)
-    keyboard = None
-    if safe:
-        selected_sheets = [dict(sheet=x['sheet'], mapping=x['mapping'], header_row=x['header_row'])
-                           for x in result if x['status'] == 'preview' and x['valid'] > 0]
-        context.user_data['excel_pending'] = {
-            'data': payload, 'sheets': selected_sheets, 'supplier_id': supplier['id'],
-            'currency': supplier['currency'], 'tax_status': supplier['tax_status'],
-            'expires': time.time() + 900,
-        }
-        lines.append(f'✅ К сохранению: {sum(x["valid"] for x in result if x["status"] == "preview")} строк из {len(selected_sheets)} лист(ов).')
-        lines.append('⚠️ Подтверди сохранение. Нераспознанные товары сохраняются и доступны для поиска по исходному названию.')
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton('✅ Сохранить Excel', callback_data='excel:save')],
-            [InlineKeyboardButton('❌ Отменить', callback_data='excel:cancel')],
-        ])
-    else:
-        lines.append('⚠️ Импорт заблокирован: проверь поставщика, валюту, НДС, листы и неоднозначные столбцы.')
-    await update.effective_message.reply_text('\n'.join(lines)[:4000], reply_markup=keyboard)
+    context.user_data['excel_pending'] = {
+        'data': payload, 'sheets': sheets, 'supplier_id': sid,
+        'supplier_name': supplier['name'], 'currency': supplier['currency'],
+        'tax_status': supplier['tax_status'], 'expires': time.time()+1800,
+    }
+    await excel_review(update.effective_message, context)
+
 
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
