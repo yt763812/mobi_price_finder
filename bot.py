@@ -12,7 +12,7 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 from database import (
-    add_supplier, get_supplier, get_supplier_offers, get_offers, init_db, list_suppliers,
+    add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings,
 )
 from product_parser import parse_product
@@ -230,13 +230,13 @@ async def show_pending(message, context):
         )
         return
     parsed = [(parse_product(name), price) for name, price in pending]
-    supported = [(p, v) for p, v in parsed if p.get('model') and p.get('storage_gb') and not p.get('warnings')]
+    supported = parsed
     previews = [f"• {p['original']} — {v}" for p, v in supported[:3]]
     await message.reply_text(
         f"📋 Прайс: {len(parsed)} строк\nПоставщик: {s['name']}\n"
         f"Валюта: {s['currency']} | НДС: {s['tax_status']}\n"
-        f"Кандидатов на запись: {len(supported)} (дубликаты свернём)\n"
-        f"Нуждаются в проверке: {len(parsed) - len(supported)}\n\n"
+        f"Строк для импорта: {len(supported)} (точные дубли названий свернём)\n"
+        f"Нераспознанные модели сохраняются по исходному названию\n\n"
         + "\n".join(previews)
         + "\n\nСохранить?",
         reply_markup=confirmation_keyboard(),
@@ -339,7 +339,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Нераспознанных строк (сохранены по исходному названию): {report['unrecognized_rows']}\n"
             f"Дубли внутри файла: {report['duplicates']}\n"
             f"Строк без цены: {skipped}\n"
-            'Отсутствующие в файле старые предложения не удалены.\n'
+            'Предыдущий прайс этого поставщика полностью заменён.\n'
             f"Валюта: {staged['currency']}, НДС: {staged['tax_status']}."
         )
     elif action == 'import:cancel':
@@ -358,7 +358,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Сохранено конфигураций: {summary['saved']}\n"
             f"Дублей внутри прайса: {summary['duplicates']}\n"
             f"Пропущено для проверки: {summary['skipped']}\n"
-            "Другие позиции поставщика не удалены."
+            "Предыдущий прайс этого поставщика полностью заменён."
             + ("\nПримеры пропусков:\n" + '\n'.join(
                 f"• {name[:70]} — {reason}" for name, reason in summary['rejected'])
                if summary['rejected'] else "")
@@ -447,6 +447,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mapping = sheet['mapping']
         col = lambda idx: '-' if idx is None else __import__('openpyxl').utils.get_column_letter(idx + 1)
         lines.append(f'Строка заголовков: {sheet["header_row"]}; товар: {col(mapping["name"])}; цена: {col(mapping["price"])}; бренд: {col(mapping["brand"])}; категория: {col(mapping["category"])}')
+        lines.append(f'Обнаруженная колонка цены: {sheet.get("price_header", "")}')
         lines.append(f'С названиями: {sheet["named"]}; с положительной ценой: {sheet["valid"]}; без цены: {sheet["no_price"]}')
         if sheet['ambiguous']:
             lines.append('⚠️ Найдено несколько подходящих столбцов — перед сохранением потребуется выбор.')
@@ -456,20 +457,20 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append('\n🔒 Предпросмотр: пока ничего не записано.')
     safe = (supplier and supplier['currency'] in ('USD','BYN','RUB','EUR')
             and supplier['tax_status'] in ('with_vat','without_vat')
-            and len(result) == 1 and result[0]['status'] == 'preview'
-            and not result[0]['ambiguous'] and not result[0]['truncated']
-            and result[0]['valid'] > 0)
+            and len([x for x in result if x['status'] == 'preview']) == 1
+            and not any(x['status'] == 'preview' and (x['ambiguous'] or x['truncated']) for x in result)
+            and next((x['valid'] for x in result if x['status'] == 'preview'), 0) > 0)
     context.user_data.pop('excel_pending', None)
     keyboard = None
     if safe:
-        sheet = result[0]
+        sheet = next(x for x in result if x['status'] == 'preview')
         context.user_data['excel_pending'] = {
             'data': payload, 'sheet': sheet['sheet'], 'mapping': sheet['mapping'],
             'header_row': sheet['header_row'], 'supplier_id': supplier['id'],
             'currency': supplier['currency'], 'tax_status': supplier['tax_status'],
             'expires': time.time() + 900,
         }
-        lines.append('⚠️ Подтверди сохранение. Нераспознанные товары будут сохранены по исходному названию, но пока не участвуют в поиске по модели.')
+        lines.append('⚠️ Подтверди сохранение. Нераспознанные товары сохраняются и доступны для поиска по исходному названию.')
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton('✅ Сохранить Excel', callback_data='excel:save')],
             [InlineKeyboardButton('❌ Отменить', callback_data='excel:cancel')],
@@ -491,72 +492,110 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_search(update.effective_message, query_text)
 
 
+def _search_normalize(text):
+    text = text.casefold().replace('ё', 'е')
+    text = re.sub(r'айфона?|айфон', 'iphone', text)
+    text = re.sub(r'(\d+)\s*(?:гб|gb)\b', r'\1gb', text)
+    return re.findall(r'[a-zа-я0-9]+', text)
+
+
+def _offer_matches(query, requested, offer):
+    original = offer['original_name']
+    found = parse_product(original)
+    # Parse from original name even when older database entries have no model.
+    query_model = requested.get('model')
+    found_model = found.get('model') or offer.get('model')
+    if query_model:
+        if found_model:
+            if query_model.casefold() != found_model.casefold():
+                return False
+        elif not all(t in _search_normalize(original) for t in _search_normalize(query)):
+            return False
+        # Never include Pro Max when the search is for Pro (or vice versa),
+        # even if a legacy parser failed to recognize the source model.
+        if query_model.startswith('iPhone ') and not found_model:
+            text_model = __import__('product_parser').detect_iphone(original)
+            if text_model != query_model:
+                return False
+    else:
+        if not all(t in _search_normalize(original) for t in _search_normalize(query)):
+            return False
+    for field in ('storage_gb', 'ram_gb', 'color', 'region', 'sim'):
+        required = requested.get(field)
+        if required is not None and (found.get(field) or offer.get(field)) != required:
+            return False
+    # Explicit product variants (e.g. Air) never leak into base-model results.
+    return True
+
+
+def _display(value, labels=None):
+    if value is None or value == '' or value == []:
+        return 'Не указан'
+    return labels.get(value, value) if labels else str(value)
+
+
+SIM_LABELS = {'esim': 'eSIM', 'sim_esim': 'SIM + eSIM',
+              'dual_sim': '2 SIM', 'dual_esim': '2 eSIM'}
+COLOR_LABELS = {'black': 'Black', 'white': 'White', 'blue': 'Blue',
+                'deep_blue': 'Deep Blue', 'sky_blue': 'Sky Blue',
+                'silver': 'Silver', 'green': 'Green', 'orange': 'Orange',
+                'purple': 'Purple', 'cosmic_orange': 'Cosmic Orange',
+                'natural_titanium': 'Natural Titanium', 'burgundy': 'Burgundy'}
+
+
+def format_offer(offer, index):
+    parsed = parse_product(offer['original_name'])
+    def get(key):
+        return parsed.get(key) or offer.get(key)
+    memory = get('storage_gb')
+    memory_label = f'{memory} GB' if memory is not None else 'Не указан'
+    condition = parsed.get('condition') or offer.get('condition_tags') or []
+    condition_label = ', '.join(condition) if condition else 'Не указано'
+    vat = {'with_vat': 'с НДС', 'without_vat': 'без НДС',
+           'unknown': 'НДС не указан'}.get(offer.get('tax_status'), 'НДС не указан')
+    return (f"{index}. 🏪 {offer['supplier_name']}\n"
+            f"{offer['original_name']}\n"
+            f"💰 {offer['price']} {offer['currency']} ({vat})\n"
+            f"Память: {memory_label} | Цвет: {_display(get('color'), COLOR_LABELS)}\n"
+            f"SIM: {_display(get('sim'), SIM_LABELS)} | Регион: {_display(get('region'))}\n"
+            f"Состояние: {condition_label}")
+
+
 async def run_search(message, query_text):
     query_text = query_text.strip()
     if not query_text:
         await message.reply_text('Напиши название товара для поиска.')
         return
     requested = parse_product(query_text)
-    if not requested.get("model") or not requested.get("storage_gb"):
-        await message.reply_text(
-            "Не удалось однозначно распознать модель и память. "
-            "Попробуй: iPhone 17 Pro 256GB Black"
-        )
+    matches = [o for o in search_offers()
+               if o['is_fresh'] and _offer_matches(query_text, requested, o)]
+    if not matches:
+        await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
         return
+    # Do not rank different currencies/VAT modes as if they are comparable.
+    groups = {}
+    for offer in matches:
+        groups.setdefault((offer['currency'], offer['tax_status']), []).append(offer)
+    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}']
+    index = 0
+    for (currency, tax), offers in sorted(groups.items()):
+        offers.sort(key=lambda o: (o['price'], o['supplier_name'].casefold()))
+        blocks.append(f'\n📊 {currency}, ' + {'with_vat':'с НДС', 'without_vat':'без НДС',
+                      'unknown':'НДС не указан'}.get(tax,'НДС не указан'))
+        for offer in offers:
+            index += 1
+            blocks.append(format_offer(offer, index))
+    chunk = ''
+    for block in blocks:
+        if len(block) > 3700:
+            block = block[:3690] + '…'
+        if chunk and len(chunk) + len(block) + 2 > 3800:
+            await message.reply_text(chunk)
+            chunk = ''
+        chunk += ('\n\n' if chunk else '') + block
+    if chunk:
+        await message.reply_text(chunk)
 
-    # We deliberately do not guess the currency or convert VAT-inclusive prices.
-    confirmed, uncertain = [], []
-    excluded_financial = 0
-    excluded_expired = 0
-    for offer in get_offers(model=requested["model"]):
-        if offer["storage_gb"] != requested["storage_gb"]:
-            continue
-        mismatch = False
-        unknown = []
-        for field, label in (("ram_gb", "RAM"), ("color", "цвет"), ("region", "регион"),
-                             ("sim", "SIM")):
-            desired = requested.get(field)
-            if desired is None:
-                continue
-            actual = offer.get(field)
-            if actual is None:
-                unknown.append(label)
-            elif actual != desired:
-                mismatch = True
-                break
-        if mismatch:
-            continue
-        if offer["currency"] != "USD" or offer["tax_status"] != "without_vat" or offer["price"] is None:
-            excluded_financial += 1
-            continue
-        if not offer["is_fresh"]:
-            excluded_expired += 1
-            continue
-        if offer.get("warnings"):
-            unknown.append("предупреждения о характеристиках")
-        (uncertain if unknown else confirmed).append((offer, unknown))
-
-    confirmed.sort(key=lambda item: (item[0]["price"], item[0]["supplier_name"]))
-    uncertain.sort(key=lambda item: (item[0]["price"], item[0]["supplier_name"]))
-
-    lines = [f"🔎 {query_text}", "Условия: актуальные цены USD, без НДС."]
-    if confirmed:
-        winner = confirmed[0][0]
-        lines += ["", f"🏆 Лучшая подтверждённая цена: {winner['price']} USD",
-                  f"Поставщик: {winner['supplier_name']}", "", "✅ Совпадения:"]
-        for offer, _ in confirmed[:10]:
-            lines.append(f"• {offer['supplier_name']}: {offer['price']} USD — {offer['original_name']}")
-    else:
-        lines += ["", "✅ Подтверждённых совпадений нет."]
-    if uncertain:
-        lines += ["", "⚠️ Возможные совпадения (не участвуют в выборе лучшей цены):"]
-        for offer, missing in uncertain[:10]:
-            lines.append(f"• {offer['supplier_name']}: {offer['price']} USD — {offer['original_name']}"
-                         f"; уточнить: {', '.join(missing)}")
-    if excluded_financial or excluded_expired:
-        lines += ["", f"Исключено: {excluded_financial} с другой валютой/НДС; "
-                  f"{excluded_expired} устаревших."]
-    await message.reply_text("\n".join(lines)[:4000])
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Telegram error: %s", context.error, exc_info=context.error)
