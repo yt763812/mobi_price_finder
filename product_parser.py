@@ -55,7 +55,7 @@ def detect_color(text):
 def detect_storage(text):
     t = normalize(text)
     # Формат 8GB/256GB: первый показатель обычно RAM, второй — накопитель.
-    pair = re.search(r"(?<!\d)(?:4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*/\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
+    pair = re.search(r"(?<!\d)(?:4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*[/+]\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
     if pair:
         return int(pair.group(1))
     found = re.findall(r"(?<!\w)(\d{1,4})\s*(tb|тб|gb|гб|g)(?!\w)", t)
@@ -63,7 +63,7 @@ def detect_storage(text):
         amount, unit = found[-1]
         size = int(amount) * (1024 if unit in ("tb", "тб") else 1)
         return size
-    pair = re.search(r"(?<!\d)(?:4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*/\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
+    pair = re.search(r"(?<!\d)(?:4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*[/+]\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
     if pair:
         return int(pair.group(1))
     # В некоторых прайсах единица измерения отсутствует.
@@ -140,6 +140,32 @@ DEVICE_PATTERNS = [
     ("HONOR", r"(?:honor\s*)([0-9]{2,3}\s*(?:pro|lite)?)", ""),
 ]
 
+# Дополнительные семейства: только при явно указанном бренде.
+# Не распознаём аксессуары по упоминанию совместимого устройства.
+EXTRA_FAMILIES = [
+    ("Huawei", r"huawei\s+(mate\s*(?:xt|x[0-9]+|[0-9]+)(?:\s*(?:pro\s*max|pro|rs|x|s))?|pura\s*[0-9]+(?:\s*(?:ultra|pro|plus))?|nova\s*[0-9]+(?:\s*(?:pro|ultra|se))?)"),
+    ("Sony", r"sony\s+(xperia\s*(?:1|5|10)\s*(?:viii|vii|vi|v|iv|iii|ii|i|[0-9]+))"),
+    ("Xiaomi", r"xiaomi\s+(mix\s*(?:flip|fold)\s*[0-9]*|redmi\s*[0-9]+[a-z]?(?:\s*(?:4g|5g|pro|plus))?|pad\s*[0-9]+(?:\s*pro)?)"),
+    ("Samsung", r"samsung\s+(?:galaxy\s+)?(a[0-9]{2}[a-z]?(?:\s*(?:4g|5g))?|tab\s+[a-z][0-9]+(?:\s*(?:ultra|plus|fe))?)"),
+    ("HONOR", r"honor\s+(magic\s*(?:v[0-9]+|[0-9]+)(?:\s*(?:pro|lite|ultimate))?|[0-9]{2,3}[a-z]?(?:\s*(?:pro|lite|5g))?)"),
+    ("Oukitel", r"oukitel\s+(?:wp|rt|g|c|k)[0-9]+[a-z]?(?:\s*(?:pro|s|ultra))?"),
+    ("Ulefone", r"ulefone\s+(?:armor|note|power)\s*[0-9]+[a-z]?(?:\s*(?:pro|ultra))?"),
+    ("8849", r"8849\s+(?:hike|shark|tank)\s*(?:mini\s*)?[0-9]+[a-z]?(?:\s*(?:pro|ultra))?"),
+    ("JBL", r"jbl\s+(?:boombox|charge|flip|xtreme|partybox|go|clip)\s*[0-9]+(?:\s*(?:essential|plus))?"),
+    ("Canon", r"canon\s+(?:eos\s+)?(?:r[0-9]+|c[0-9]+|[0-9]+d)\b"),
+    ("Nikon", r"nikon\s+(?:coolpix\s+)?(?:z\s*[0-9]+|p[0-9]+|d[0-9]+)\b"),
+]
+
+def detect_extra_model(text):
+    t = normalize(text)
+    if re.search(r"\b(?:cover|case|чехол|protector|adapter|battery grip|mount adapter|for xperia|для xperia)\b", t):
+        return None, None
+    for brand, pattern in EXTRA_FAMILIES:
+        m = re.search(r"(?<!\w)" + pattern + r"(?!\w)", t, re.I)
+        if m:
+            return brand, re.sub(r"\s+", " ", m.group(0)).upper()
+    return None, None
+
 def detect_other_model(text):
     t = normalize(text)
     for brand, pattern, prefix in DEVICE_PATTERNS:
@@ -155,15 +181,25 @@ def detect_other_model(text):
                 continue
             name = re.sub(r"\s+", " ", match.group(1).upper()).strip()
             return brand, (prefix + " " + name).strip()
-    return None, None
+    return detect_extra_model(text)
 
 def detect_ram(text):
     t = normalize(text)
-    pair = re.search(r"(?<!\d)(4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*/\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
+    pair = re.search(r"(?<!\d)(4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*[/+]\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
     if pair:
         return int(pair.group(1))
     match = re.search(r"(?<!\w)(?:ram|озу|оперативная память)\s*[:\-]?\s*(4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?(?!\w)", t)
     return int(match.group(1)) if match else None
+
+
+def has_unmodeled_bundle(text):
+    """Fail closed: do not merge different bundles/accessories as one model."""
+    t = normalize(text)
+    return bool(re.search(
+        r"(?<!\w)(?:body\s*only|body|lens\s*kit|kit\s*lens|"
+        r"double\s*kit|twin\s*kit|kit|bundle|комплект|набор|"
+        r"с\s*объективом|без\s*объектива)(?!\w)", t
+    ))
 
 
 def parse_product(text):
@@ -171,6 +207,10 @@ def parse_product(text):
     other_brand, other_model = detect_other_model(text) if not model else (None, None)
     if not model:
         model = other_model
+    # A bundle changes the commercial SKU. Until it is modeled explicitly,
+    # store it by full original name rather than a lossy base-model signature.
+    if model and has_unmodeled_bundle(text):
+        model = None
     region = detect_region(text)
     sim = detect_sim(text)
     warnings = []
