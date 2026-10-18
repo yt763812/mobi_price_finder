@@ -88,3 +88,33 @@ def inspect_xlsx(data):
         return sheets
     finally:
         wb.close()
+
+
+def extract_xlsx(data, sheet_name, mapping, header_row):
+    """Extract all validated rows from one explicitly selected sheet."""
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError('Файл слишком большой')
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name]
+        if ws.max_row and ws.max_row > MAX_ROWS:
+            raise ValueError('Превышен лимит 30000 строк')
+        rows = []
+        skipped = 0
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            def val(key):
+                i = mapping.get(key)
+                return row[i] if i is not None and i < len(row) else None
+            name = _clean(val('name'))
+            if not name:
+                continue
+            amount = _price(val('price'))
+            if amount is None:
+                skipped += 1
+                continue
+            brand = _clean(val('brand'))
+            full_name = (brand + ' ' + name).strip() if brand and not name.casefold().startswith(brand.casefold() + ' ') else name
+            rows.append((full_name, amount))
+        return rows, skipped
+    finally:
+        wb.close()
