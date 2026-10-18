@@ -218,6 +218,37 @@ def get_supplier(supplier_id):
             return cur.fetchone()
 
 
+def rename_supplier(supplier_id, new_name):
+    """Rename a supplier without changing its ID or its saved offers."""
+    name = new_name.strip() if isinstance(new_name, str) else ''
+    if not name or len(name) > 120 or '\n' in name:
+        raise ValueError('Название должно быть одной строкой (до 120 символов).')
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM suppliers WHERE lower(name) = lower(%s) AND id <> %s', (name, supplier_id))
+            if cur.fetchone():
+                raise ValueError('Поставщик с таким названием уже существует.')
+            try:
+                cur.execute('UPDATE suppliers SET name = %s WHERE id = %s RETURNING id', (name, supplier_id))
+            except psycopg.errors.UniqueViolation:
+                raise ValueError('Поставщик с таким названием уже существует.') from None
+            if not cur.fetchone():
+                return None
+    return get_supplier(supplier_id)
+
+
+def delete_supplier(supplier_id):
+    """Atomically remove supplier offers and the supplier itself."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM suppliers WHERE id = %s FOR UPDATE', (supplier_id,))
+            if not cur.fetchone():
+                return False
+            cur.execute('DELETE FROM offers WHERE supplier_id = %s', (supplier_id,))
+            cur.execute('DELETE FROM suppliers WHERE id = %s', (supplier_id,))
+    return True
+
+
 def update_supplier_settings(supplier_id, currency=None, tax_status=None):
     if currency is not None and currency not in ('USD', 'BYN', 'RUB', 'EUR'):
         raise ValueError('Unsupported currency')
