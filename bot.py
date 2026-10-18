@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
-    save_price_list, save_excel_rows, update_supplier_settings,
+    save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
 )
 from product_parser import parse_product
 from excel_importer import inspect_xlsx, extract_xlsx, MAX_FILE_BYTES
@@ -95,6 +95,23 @@ def keyboard_suppliers():
                for s in list_suppliers()[:75]]
     buttons.append([InlineKeyboardButton("➕ Новый поставщик", callback_data="supplier:new")])
     return InlineKeyboardMarkup(buttons)
+
+
+def supplier_manage_keyboard(supplier):
+    sid = supplier['id']
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Переименовать", callback_data=f"supplier:rename:{sid}")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"supplier:delete:{sid}")],
+        [InlineKeyboardButton("⚙️ Валюта и НДС", callback_data=f"supplier:settings:{sid}")],
+        [InlineKeyboardButton("👥 Все поставщики", callback_data="nav:suppliers")],
+    ])
+
+
+def supplier_delete_keyboard(sid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Да, удалить с товарами", callback_data=f"supplier:confirm_delete:{sid}")],
+        [InlineKeyboardButton("↩️ Отмена", callback_data=f"supplier:cancel_delete:{sid}")],
+    ])
 
 
 def settings_keyboard(supplier):
@@ -284,6 +301,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data['pending'] = rows
                 await show_pending(query.message, context)
     elif action == 'supplier:new':
+        context.user_data.pop('await_rename_id', None)
         context.user_data['await_name'] = True
         await query.message.reply_text("Введи название нового поставщика одним сообщением.")
     elif action.startswith('pick:'):
@@ -293,8 +311,56 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Поставщик не найден")
             return
         context.user_data['supplier_id'] = sid
-        await query.message.reply_text(f"✅ Выбран поставщик: {s['name']}")
+        await query.message.reply_text(f"✅ Выбран поставщик: {s['name']}", reply_markup=supplier_manage_keyboard(s))
         await show_pending(query.message, context)
+    elif action.startswith('supplier:'):
+        parts = action.split(':')
+        if len(parts) != 3 or not parts[2].isdigit():
+            return
+        operation, sid = parts[1], int(parts[2])
+        s = get_supplier(sid)
+        if not s:
+            await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
+            return
+        if operation == 'rename':
+            context.user_data.pop('await_name', None)
+            context.user_data['await_rename_id'] = sid
+            await query.message.reply_text(
+                f"✏️ Новое название для «{s['name']}»? Отправь одним сообщением. "
+                "Чтобы отменить, нажми кнопку.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton('❌ Отмена', callback_data=f'supplier:cancel_rename:{sid}')
+                ]])
+            )
+        elif operation == 'cancel_rename':
+            if context.user_data.get('await_rename_id') == sid:
+                context.user_data.pop('await_rename_id', None)
+            await query.message.reply_text('Изменение названия отменено.', reply_markup=supplier_manage_keyboard(s))
+        elif operation == 'delete':
+            await query.message.reply_text(
+                f"⚠️ Удалить «{s['name']}» и ВСЕ его сохранённые товары? "
+                "Это действие нельзя отменить.", reply_markup=supplier_delete_keyboard(sid)
+            )
+        elif operation == 'cancel_delete':
+            await query.message.reply_text('Удаление отменено.', reply_markup=supplier_manage_keyboard(s))
+        elif operation == 'confirm_delete':
+            deleted = delete_supplier(sid)
+            if deleted:
+                if context.user_data.get('supplier_id') == sid:
+                    context.user_data.pop('supplier_id', None)
+                    context.user_data.pop('pending', None)
+                    context.user_data.pop('excel_pending', None)
+                if context.user_data.get('await_rename_id') == sid:
+                    context.user_data.pop('await_rename_id', None)
+                await query.message.reply_text(
+                    f"✅ Поставщик «{s['name']}» и его товары удалены.",
+                    reply_markup=keyboard_suppliers()
+                )
+            else:
+                await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
+        elif operation == 'settings':
+            context.user_data['supplier_id'] = sid
+            await query.message.reply_text(f"⚙️ {s['name']}", reply_markup=settings_keyboard(s))
     elif action.startswith('settings:currency:'):
         sid = int(action.rsplit(':', 1)[1])
         buttons = [[InlineKeyboardButton(c, callback_data=f"setcur:{sid}:{c}")]
@@ -369,6 +435,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
     text = (update.effective_message.text or '').strip()
+    rename_sid = context.user_data.get('await_rename_id')
+    if rename_sid is not None:
+        if not text or len(text) > 120 or '\n' in text:
+            await update.effective_message.reply_text('Название должно быть одной строкой (до 120 символов).')
+            return
+        try:
+            renamed = rename_supplier(rename_sid, text)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        if renamed is None:
+            context.user_data.pop('await_rename_id', None)
+            await update.effective_message.reply_text('Поставщик больше не существует.')
+            return
+        context.user_data.pop('await_rename_id', None)
+        await update.effective_message.reply_text(
+            f"✅ Название изменено на «{renamed['name']}».",
+            reply_markup=supplier_manage_keyboard(renamed)
+        )
+        return
     if context.user_data.pop('await_name', False):
         if not text or len(text) > 120 or '\n' in text:
             context.user_data['await_name'] = True
