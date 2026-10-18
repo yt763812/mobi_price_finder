@@ -59,6 +59,7 @@ def init_db():
                     UNIQUE(supplier_id, signature)
                 )
             """)
+            cur.execute("ALTER TABLE offers ADD COLUMN IF NOT EXISTS ram_gb INTEGER")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_offers_model
                 ON offers(model, storage_gb, color)
@@ -96,6 +97,7 @@ def _signature(product):
         "brand": product.get("brand"),
         "model": product.get("model"),
         "storage_gb": product.get("storage_gb"),
+        "ram_gb": product.get("ram_gb"),
         "color": product.get("color"),
         "region": product.get("region"),
         "sim": product.get("sim"),
@@ -105,6 +107,8 @@ def _signature(product):
         identity["unrecognized_name"] = " ".join(
             product.get("original", "").casefold().split()
         )
+    if identity["ram_gb"] is None:
+        del identity["ram_gb"]  # Backward-compatible signatures for old offers
     payload = json.dumps(identity, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -131,15 +135,16 @@ def save_offer(supplier_id, product, price, currency=None, tax_status="unknown")
             cur.execute("""
                 INSERT INTO offers (
                     supplier_id, signature, original_name, brand, model,
-                    storage_gb, color, region, sim, condition_tags, warnings,
+                    storage_gb, color, region, sim, condition_tags, warnings, ram_gb,
                     price, currency, tax_status
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s::jsonb, %s::jsonb, %s, %s, %s
+                    %s::jsonb, %s::jsonb, %s, %s, %s, %s
                 )
                 ON CONFLICT (supplier_id, signature) DO UPDATE SET
                     original_name = EXCLUDED.original_name,
                     warnings = EXCLUDED.warnings,
+                    ram_gb = EXCLUDED.ram_gb,
                     price = EXCLUDED.price,
                     currency = EXCLUDED.currency,
                     tax_status = EXCLUDED.tax_status,
@@ -154,7 +159,7 @@ def save_offer(supplier_id, product, price, currency=None, tax_status="unknown")
                 product.get("region"), product.get("sim"),
                 json.dumps(product.get("condition") or [], ensure_ascii=False),
                 json.dumps(product.get("warnings") or [], ensure_ascii=False),
-                amount, currency, tax_status,
+                product.get("ram_gb"), amount, currency, tax_status,
             ))
             return cur.fetchone()["id"]
 
@@ -266,15 +271,16 @@ def save_price_list(supplier_id, rows):
                 cur.execute('''
                     INSERT INTO offers (
                         supplier_id, signature, original_name, brand, model,
-                        storage_gb, color, region, sim, condition_tags, warnings,
+                        storage_gb, color, region, sim, condition_tags, warnings, ram_gb,
                         price, currency, tax_status
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s::jsonb, %s::jsonb, %s, %s, %s
+                        %s::jsonb, %s::jsonb, %s, %s, %s, %s
                     )
                     ON CONFLICT (supplier_id, signature) DO UPDATE SET
                         original_name = EXCLUDED.original_name,
                         warnings = EXCLUDED.warnings,
+                    ram_gb = EXCLUDED.ram_gb,
                         price = EXCLUDED.price,
                         currency = EXCLUDED.currency,
                         tax_status = EXCLUDED.tax_status,
@@ -286,7 +292,7 @@ def save_price_list(supplier_id, rows):
                     product.get('region'), product.get('sim'),
                     json.dumps(product.get('condition') or [], ensure_ascii=False),
                     json.dumps(product.get('warnings') or [], ensure_ascii=False),
-                    amount, supplier['currency'], supplier['tax_status'],
+                    product.get('ram_gb'), amount, supplier['currency'], supplier['tax_status'],
                 ))
     return {'saved': len(by_signature), 'skipped': len(rejected),
             'duplicates': len(rows) - len(by_signature) - len(rejected),
