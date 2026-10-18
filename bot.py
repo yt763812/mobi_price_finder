@@ -14,6 +14,7 @@ from database import (
     save_price_list, update_supplier_settings,
 )
 from product_parser import parse_product
+from excel_importer import inspect_xlsx, MAX_FILE_BYTES
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -378,6 +379,52 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorize(update):
+        return
+    doc = update.effective_message.document
+    if not doc or not doc.file_name.lower().endswith('.xlsx'):
+        await update.effective_message.reply_text('Пока поддерживаются только Excel-файлы .xlsx.')
+        return
+    if doc.file_size and doc.file_size > MAX_FILE_BYTES:
+        await update.effective_message.reply_text('Файл больше 12 МБ, импорт пока недоступен.')
+        return
+    try:
+        tg_file = await doc.get_file()
+        payload = bytes(await tg_file.download_as_bytearray())
+        result = inspect_xlsx(payload)
+    except Exception as exc:
+        logger.exception('Excel preview failed')
+        await update.effective_message.reply_text('Не удалось прочитать Excel: ' + str(exc)[:160])
+        return
+    supplier_id = context.user_data.get('supplier_id')
+    supplier = get_supplier(supplier_id) if supplier_id else None
+    lines = ['📊 Предпросмотр Excel — БЕЗ СОХРАНЕНИЯ',
+             f'Файл: {doc.file_name}',
+             f'Поставщик: {supplier["name"] if supplier else "не выбран"}']
+    if supplier:
+        lines.append(f'Настройки поставщика: {supplier["currency"]}, {supplier["tax_status"]}')
+    else:
+        lines.append('Выбери поставщика через /suppliers перед будущим импортом.')
+    for sheet in result[:8]:
+        lines.append('\nЛист: ' + sheet['sheet'])
+        if sheet['status'] == 'unknown':
+            lines.append('⚠️ Не удалось уверенно найти столбцы названия и цены. Нужен ручной выбор.')
+            continue
+        mapping = sheet['mapping']
+        col = lambda idx: '-' if idx is None else __import__('openpyxl').utils.get_column_letter(idx + 1)
+        lines.append(f'Строка заголовков: {sheet["header_row"]}; товар: {col(mapping["name"])}; цена: {col(mapping["price"])}; бренд: {col(mapping["brand"])}; категория: {col(mapping["category"])}')
+        lines.append(f'С названиями: {sheet["named"]}; с положительной ценой: {sheet["valid"]}; без цены: {sheet["no_price"]}')
+        if sheet['ambiguous']:
+            lines.append('⚠️ Найдено несколько подходящих столбцов — перед сохранением потребуется выбор.')
+        if sheet['truncated']:
+            lines.append('⚠️ Предпросмотр ограничен 30 000 строками.')
+        lines.extend('• ' + example for example in sheet['samples'])
+    lines.append('\n🔒 Это только анализ файла. В PostgreSQL ничего не записано.')
+    await update.effective_message.reply_text('\n'.join(lines)[:4000])
+
+
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
@@ -471,6 +518,7 @@ def main():
                              ('find', find), ('menu', menu), ('mode', mode)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
     logger.info('Mobi Price Finder запущен')
