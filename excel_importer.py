@@ -1,7 +1,8 @@
 """Safe, preview-only XLSX inspection. No database writes."""
 import io
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from collections import Counter
 from openpyxl import load_workbook
 from product_parser import parse_product
 
@@ -38,21 +39,48 @@ def _indices(row, aliases):
 
 
 def _price(value):
+    """Read numeric Excel prices without mistaking float precision for invalid prices."""
     if isinstance(value, bool) or value is None:
         return None
     raw = _clean(value).replace('\u00a0', '').replace(' ', '').replace(',', '.')
-    if not re.fullmatch(r'\d+(?:\.\d{1,2})?', raw):
+    if not re.fullmatch(r'\d+(?:\.\d+)?', raw):
         return None
     try:
         result = Decimal(raw)
-        return result if result > 0 else None
-    except InvalidOperation:
+        if not result.is_finite() or result <= 0:
+            return None
+        return result.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
         return None
 
 
+def _price_column_is_suspicious(values):
+    """A date copied down a column must not be accepted as a price column."""
+    if len(values) < 8:
+        return False
+    normalized = [str(x) for x in values]
+    common = Counter(normalized).most_common(1)[0][1]
+    return common / len(normalized) >= 0.95 and len(set(normalized)) <= 2
+
+
+def _column_price_quality(ws, mapping, header_row, max_sample=150):
+    prices = []
+    names = 0
+    for row in ws.iter_rows(min_row=header_row + 1, max_row=min(ws.max_row or max_sample, header_row + max_sample), values_only=True):
+        n = mapping.get('name'); p = mapping.get('price')
+        name = _clean(row[n]) if n is not None and n < len(row) else ''
+        if len(name) < 5 or not re.search(r'[a-zа-я]', name, re.I):
+            continue
+        names += 1
+        val = _price(row[p]) if p is not None and p < len(row) else None
+        if val is not None:
+            prices.append(val)
+    return names, prices
+
+
 def _positional_mapping(ws):
-    """Detect headerless supplier price lists from repeated name/price pairs."""
-    rows = list(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 60, 60), values_only=True))
+    """Detect price columns by validity AND variation; repeated dates are rejected."""
+    rows = list(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 120, 120), values_only=True))
     if not rows:
         return None
     scores = []
@@ -60,21 +88,26 @@ def _positional_mapping(ws):
         for price_idx in range(min(ws.max_column or 0, 12)):
             if name_idx == price_idx:
                 continue
-            good = 0
+            prices = []
             for row in rows:
                 name = _clean(row[name_idx]) if name_idx < len(row) else ''
                 val = row[price_idx] if price_idx < len(row) else None
-                # Avoid dates, numeric SKUs and short section headings.
-                if (len(name) >= 9 and re.search(r'[A-Za-zА-Яа-я]', name)
-                        and _price(val) is not None):
-                    good += 1
-            scores.append((good, name_idx, price_idx))
-    scores.sort(reverse=True)
-    if not scores or scores[0][0] < 4:
+                if len(name) >= 9 and re.search(r'[A-Za-zА-Яа-я]', name):
+                    price = _price(val)
+                    if price is not None:
+                        prices.append(price)
+            if len(prices) < 4 or _price_column_is_suspicious(prices):
+                continue
+            diversity = len(set(prices)) / len(prices)
+            scores.append((len(prices), diversity, name_idx, price_idx))
+    if not scores:
         return None
-    good, name, price = scores[0]
-    if len(scores) > 1 and scores[1][0] >= good * 0.9:
-        return None  # Ambiguous columns must not be guessed.
+    scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    good, diversity, name, price = scores[0]
+    if len(scores) > 1:
+        second = scores[1]
+        if second[0] >= good * 0.9 and abs(second[1] - diversity) < 0.08:
+            return None  # Equally plausible columns require manual confirmation.
     return {'name': name, 'price': price, 'brand': None,
             'category': None, 'color': None, 'region': None}
 
@@ -112,6 +145,10 @@ def inspect_xlsx(data):
                     header_row = 0
                     price_header = 'Без заголовка (определено по содержимому)'
             if mapping is None:
+                sheets.append({'sheet': ws.title, 'status': 'unknown'})
+                continue
+            _, price_probe = _column_price_quality(ws, mapping, header_row)
+            if _price_column_is_suspicious(price_probe):
                 sheets.append({'sheet': ws.title, 'status': 'unknown'})
                 continue
             count = valid = no_price = 0
@@ -170,6 +207,9 @@ def extract_xlsx(data, sheet_name, mapping, header_row):
         ws = wb[sheet_name]
         if ws.max_row and ws.max_row > MAX_ROWS:
             raise ValueError('Превышен лимит 30000 строк')
+        _, price_probe = _column_price_quality(ws, mapping, header_row)
+        if _price_column_is_suspicious(price_probe):
+            raise ValueError('Столбец цены содержит почти одинаковые значения (возможно, дату прайса). Выбери правильный столбец.')
         rows = []
         skipped = 0
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
@@ -227,6 +267,9 @@ def inspect_mapping(data, sheet_name, mapping, header_row):
             return {'valid': 0, 'named': 0, 'no_price': 0, 'samples': [], 'truncated': True}
         if mapping.get('name') is None or mapping.get('price') is None or mapping['name'] == mapping['price']:
             return {'valid': 0, 'named': 0, 'no_price': 0, 'samples': [], 'truncated': False}
+        _, price_probe = _column_price_quality(ws, mapping, header_row)
+        if _price_column_is_suspicious(price_probe):
+            return {'valid': 0, 'named': 0, 'no_price': 0, 'samples': [], 'truncated': False, 'warning': 'Подозрительный столбец цены: одинаковые значения, возможно дата'}
         valid = named = no_price = 0
         samples = []
         for row in ws.iter_rows(min_row=header_row+1, values_only=True):
