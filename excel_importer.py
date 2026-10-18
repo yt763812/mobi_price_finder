@@ -4,9 +4,11 @@ import re
 from decimal import Decimal, InvalidOperation
 from openpyxl import load_workbook
 
-NAME_HEADERS = ('модель', 'наименование', 'название товара', 'товар', 'product', 'model', 'item', 'description')
+NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название товара', 'товар', 'product', 'model', 'item', 'description')
 PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб')
-BRAND_HEADERS = ('бренд', 'brand', 'производитель')
+BRAND_HEADERS = ('бренд', 'брэнд', 'brand', 'производитель')
+COLOR_HEADERS = ('цвет', 'color', 'colour')
+REGION_HEADERS = ('происхождение', 'регион', 'страна', 'region')
 CATEGORY_HEADERS = ('категория', 'category')
 BAD_PRICE = ('итого', 'total', 'сумма', 'розница', 'retail', 'ррц')
 MAX_FILE_BYTES = 12 * 1024 * 1024
@@ -47,6 +49,35 @@ def _price(value):
         return None
 
 
+def _positional_mapping(ws):
+    """Detect headerless supplier price lists from repeated name/price pairs."""
+    rows = list(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 60, 60), values_only=True))
+    if not rows:
+        return None
+    scores = []
+    for name_idx in range(min(ws.max_column or 0, 12)):
+        for price_idx in range(min(ws.max_column or 0, 12)):
+            if name_idx == price_idx:
+                continue
+            good = 0
+            for row in rows:
+                name = _clean(row[name_idx]) if name_idx < len(row) else ''
+                val = row[price_idx] if price_idx < len(row) else None
+                # Avoid dates, numeric SKUs and short section headings.
+                if (len(name) >= 9 and re.search(r'[A-Za-zА-Яа-я]', name)
+                        and _price(val) is not None):
+                    good += 1
+            scores.append((good, name_idx, price_idx))
+    scores.sort(reverse=True)
+    if not scores or scores[0][0] < 4:
+        return None
+    good, name, price = scores[0]
+    if len(scores) > 1 and scores[1][0] >= good * 0.9:
+        return None  # Ambiguous columns must not be guessed.
+    return {'name': name, 'price': price, 'brand': None,
+            'category': None, 'color': None, 'region': None}
+
+
 def inspect_xlsx(data):
     if len(data) > MAX_FILE_BYTES:
         raise ValueError('Файл больше 12 МБ. Пришли файл поменьше.')
@@ -62,14 +93,23 @@ def inspect_xlsx(data):
                 prices = _preferred_price(row)
                 brands = _indices(row, BRAND_HEADERS)
                 categories = _indices(row, CATEGORY_HEADERS)
+                colors = _indices(row, COLOR_HEADERS)
+                regions = _indices(row, REGION_HEADERS)
                 if names and prices:
                     header_row = row_num
                     mapping = {'name': names[0], 'price': prices[0],
                                'brand': brands[0] if brands else None,
-                               'category': categories[0] if categories else None}
+                               'category': categories[0] if categories else None,
+                               'color': colors[0] if colors else None,
+                               'region': regions[0] if regions else None}
                     price_header = _clean(row[prices[0]])
                     ambiguous = len(names) > 1 or (len(prices) > 1 and _header(row[prices[0]]) == _header(row[prices[1]]))
                     break
+            if mapping is None:
+                mapping = _positional_mapping(ws)
+                if mapping is not None:
+                    header_row = 0
+                    price_header = 'Без заголовка (определено по содержимому)'
             if mapping is None:
                 sheets.append({'sheet': ws.title, 'status': 'unknown'})
                 continue
@@ -79,7 +119,7 @@ def inspect_xlsx(data):
                 def val(idx):
                     return row[idx] if idx is not None and idx < len(row) else None
                 name = _clean(val(mapping['name']))
-                if not name:
+                if not name or len(name) < 5:
                     continue
                 count += 1
                 price = _price(val(mapping['price']))
@@ -117,7 +157,7 @@ def extract_xlsx(data, sheet_name, mapping, header_row):
                 i = mapping.get(key)
                 return row[i] if i is not None and i < len(row) else None
             name = _clean(val('name'))
-            if not name:
+            if not name or len(name) < 5:
                 continue
             amount = _price(val('price'))
             if amount is None:
@@ -125,6 +165,11 @@ def extract_xlsx(data, sheet_name, mapping, header_row):
                 continue
             brand = _clean(val('brand'))
             full_name = (brand + ' ' + name).strip() if brand and not name.casefold().startswith(brand.casefold() + ' ') else name
+            # Keep extra attributes in the searchable name: database schema remains unchanged.
+            for key in ('color', 'region'):
+                extra = _clean(val(key))
+                if extra and extra.casefold() not in full_name.casefold():
+                    full_name += ' ' + extra
             rows.append((full_name, amount))
         return rows, skipped
     finally:
