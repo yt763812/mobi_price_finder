@@ -308,6 +308,17 @@ async def excel_review(message, context):
         if item.get('enabled'):
             lines.append(f'✅ {item["sheet"]}: {item["valid"]} строк')
             lines.extend('• '+v for v in item.get('samples', [])[:2])
+            for parsed in item.get('parsed_samples', [])[:2]:
+                display = lambda v: str(v) if v is not None else 'Не указан'
+                lines.append('   ↳ Модель: '+display(parsed.get('model'))
+                             +' | Память: '+(str(parsed['storage'])+' GB' if parsed.get('storage') is not None else 'Не указан'))
+                lines.append('   ↳ Цвет: '+display(parsed.get('color'))
+                             +' | SIM: '+display(parsed.get('sim'))
+                             +' | Регион: '+display(parsed.get('region')))
+                if parsed.get('warnings'):
+                    lines.append('   ⚠️ '+'; '.join(parsed['warnings'])[:130])
+            if item.get('uncertain'):
+                lines.append(f'⚠️ Неоднозначные характеристики: {item["uncertain"]} строк(и). Исходные названия сохраняются.')
         elif item.get('skipped'):
             lines.append('⏭ '+item['sheet']+' — пропущен')
         else:
@@ -762,7 +773,9 @@ COLOR_LABELS = {'black': 'Black', 'white': 'White', 'blue': 'Blue',
                 'silver': 'Silver', 'green': 'Green', 'orange': 'Orange',
                 'purple': 'Purple', 'cosmic_orange': 'Cosmic Orange',
                 'natural_titanium': 'Natural Titanium', 'burgundy': 'Burgundy',
-                'glacier': 'Glacier'}
+                'glacier': 'Glacier', 'starlight': 'Starlight',
+                'midnight': 'Midnight', 'graphite': 'Graphite',
+                'gold': 'Gold', 'pink': 'Pink'}
 
 
 def format_offer(offer, index):
