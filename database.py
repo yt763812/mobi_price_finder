@@ -297,3 +297,62 @@ def save_price_list(supplier_id, rows):
     return {'saved': len(by_signature), 'skipped': len(rejected),
             'duplicates': len(rows) - len(by_signature) - len(rejected),
             'rejected': rejected[:5]}
+
+
+def save_excel_rows(supplier_id, rows, currency, tax_status):
+    """Atomic import, including unrecognized models under their full original names.
+
+    The supplier settings are checked again inside the transaction. A later
+    import supersedes old prices; minimum duplicate wins within this file.
+    """
+    if currency not in ('USD', 'BYN', 'RUB', 'EUR') or tax_status not in ('with_vat', 'without_vat'):
+        raise ValueError('Неизвестны валюта или НДС')
+    by_signature = {}
+    unrecognized = 0
+    rejected = 0
+    for product, raw_price in rows:
+        try:
+            amount = Decimal(str(raw_price))
+            if not amount.is_finite() or amount <= 0:
+                raise ValueError('invalid price')
+        except (ValueError, ArithmeticError, __import__('decimal').InvalidOperation):
+            rejected += 1
+            continue
+        if not product.get('model') or not product.get('storage_gb') or product.get('warnings'):
+            unrecognized += 1
+            # Preserve full original name, never conflate unknown with recognized products.
+            product = dict(product)
+            product['model'] = None
+            product['storage_gb'] = None
+            product['ram_gb'] = None
+            product['color'] = None
+            product['region'] = None
+            product['sim'] = None
+        signature = _signature(product)
+        if signature not in by_signature or amount < by_signature[signature][1]:
+            by_signature[signature] = (product, amount)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT currency, tax_status FROM suppliers WHERE id=%s FOR UPDATE', (supplier_id,))
+            supplier = cur.fetchone()
+            if not supplier or supplier['currency'] != currency or supplier['tax_status'] != tax_status:
+                raise ValueError('Настройки поставщика изменились. Отправь файл заново.')
+            for signature, (product, amount) in by_signature.items():
+                cur.execute("""
+                    INSERT INTO offers (supplier_id, signature, original_name, brand, model,
+                        storage_gb, color, region, sim, condition_tags, warnings, ram_gb,
+                        price, currency, tax_status)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
+                    ON CONFLICT (supplier_id, signature) DO UPDATE SET
+                        original_name=EXCLUDED.original_name, warnings=EXCLUDED.warnings,
+                        ram_gb=EXCLUDED.ram_gb, price=EXCLUDED.price,
+                        currency=EXCLUDED.currency, tax_status=EXCLUDED.tax_status,
+                        updated_at=now()
+                """, (supplier_id, signature, product['original'], product.get('brand'),
+                      product.get('model'), product.get('storage_gb'), product.get('color'),
+                      product.get('region'), product.get('sim'),
+                      json.dumps(product.get('condition') or [], ensure_ascii=False),
+                      json.dumps(product.get('warnings') or [], ensure_ascii=False),
+                      product.get('ram_gb'), amount, currency, tax_status))
+    return {'saved': len(by_signature), 'unrecognized_rows': unrecognized,
+            'duplicates': len(rows) - rejected - len(by_signature), 'rejected': rejected}
