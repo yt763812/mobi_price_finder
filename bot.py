@@ -5,6 +5,8 @@ import os
 import re
 import hashlib
 import time
+from datetime import timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -181,8 +183,31 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await mode(update, context)
 
 
+def _price_import_time(value, short=False):
+    if value is None:
+        return 'нет данных'
+    try:
+        tz_name = os.getenv('PRICE_TIMEZONE', 'Europe/Moscow')
+        try:
+            tz = ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            tz = timezone.utc
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(tz).strftime('%d.%m' if short else '%d.%m.%Y в %H:%M')
+    except (AttributeError, ValueError, TypeError):
+        return 'нет данных'
+
+
+def _supplier_title(supplier):
+    return (f"{supplier['name']}\n"
+            f"🕒 Последний прайс: {_price_import_time(supplier.get('last_price_import_at'))}")
+
+
 def keyboard_suppliers():
-    buttons = [[InlineKeyboardButton(s['name'], callback_data=f"pick:{s['id']}")]
+    buttons = [[InlineKeyboardButton(
+                    f"{s['name']} · {_price_import_time(s.get('last_price_import_at'), short=True)}",
+                    callback_data=f"pick:{s['id']}")]
                for s in list_suppliers()[:75]]
     buttons.append([InlineKeyboardButton("➕ Новый поставщик", callback_data="supplier:new")])
     return InlineKeyboardMarkup(buttons)
@@ -246,7 +271,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def suppliers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
-    await update.effective_message.reply_text("Выбери поставщика:", reply_markup=keyboard_suppliers())
+    await update.effective_message.reply_text("Выбери поставщика (рядом дата последнего прайса):", reply_markup=keyboard_suppliers())
 
 
 async def addsupplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -570,7 +595,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Поставщик не найден")
             return
         context.user_data['supplier_id'] = sid
-        await query.message.reply_text(f"✅ Выбран поставщик: {s['name']}", reply_markup=supplier_manage_keyboard(s, is_owner(update)))
+        await query.message.reply_text(f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, is_owner(update)))
         await show_pending(query.message, context)
     elif action.startswith('supplier:'):
         parts = action.split(':')
