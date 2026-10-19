@@ -95,6 +95,15 @@ def parse_price_list(text, initial_brand=None, return_brand=False):
     trailing = r"(?:\s*\((?:e\s*sim|sim\s*\+\s*esim|dual\s*sim)\))?"
     priced = re.compile(rf"^(.+?)\s*[-—–:]\s*[$€₽]?\s*{number}\s*{currency}{trailing}\s*$", re.I)
     standalone = re.compile(rf"^[$€₽]?\s*{number}\s*{currency}{trailing}\s*$", re.I)
+    # Undelimited prices are common in pasted Telegram stock lists:
+    # "17 Pro 256GB (черный) eSIM  1320".
+    # Require TWO spaces between the item and its price so years, RAM, memory,
+    # model numbers and product codes aren't accidentally treated as prices.
+    # Accept a harmless decorative fire emoji after the price.
+    plain_final_price = re.compile(
+        rf"^(.+?)\s{{2,}}[$€₽]?\s*{number}\s*{currency}{trailing}\s*(?:🔥\s*)?$",
+        re.I,
+    )
     for raw in html.unescape(text).splitlines():
         line = raw.strip().strip('*_`\\ ').strip()
         if not line:
@@ -116,6 +125,13 @@ def parse_price_list(text, initial_brand=None, return_brand=False):
             suffix = re.search(r'\(e\s*sim\)', line, re.I)
             if suffix and not re.search(r'\besim\b', name, re.I):
                 name += ' eSIM'
+            if name:
+                output.append((contextual_name(name, active_brand), match.group(2)))
+            pending = None
+            continue
+        match = plain_final_price.fullmatch(line)
+        if match:
+            name = _clean_price_name(match.group(1))
             if name:
                 output.append((contextual_name(name, active_brand), match.group(2)))
             pending = None
