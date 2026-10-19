@@ -212,6 +212,29 @@ def get_supplier_offers(supplier_id, limit=20):
             return cur.fetchall()
 
 
+def export_supplier_offers(supplier_id):
+    """Return the entire persisted snapshot for a supplier, without search limits.
+
+    Includes even stale and unrecognized offers; used for operator audit only.
+    """
+    if not isinstance(supplier_id, int) or supplier_id <= 0:
+        raise ValueError('Invalid supplier ID')
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.original_name, o.brand, o.model, o.storage_gb,
+                       o.ram_gb, o.color, o.region, o.sim, o.condition_tags,
+                       o.warnings, o.price, o.currency, o.tax_status,
+                       o.created_at, o.updated_at,
+                       (o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour') AS is_fresh
+                FROM offers o
+                JOIN suppliers s ON s.id = o.supplier_id
+                WHERE o.supplier_id = %s
+                ORDER BY o.original_name, o.id
+            """, (supplier_id,))
+            return cur.fetchall()
+
+
 def list_suppliers():
     """Show registered suppliers without exposing database credentials."""
     with _connect() as conn:
