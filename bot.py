@@ -58,7 +58,7 @@ async def authorize(update):
 
 def _clean_price_name(value):
     # Remove decorative symbols, not letters or meaningful model attributes.
-    value = re.sub(r"^[\s•▪▫🔹🔸✅☑️📱📦💎🔥⭐️✨➖➡️—–-]+", "", value)
+    value = re.sub(r"^[\s•▪▫◾🔹🔸✅☑️📱🎧⌚💻📦💎🔥⭐️✨➖➡️—–-\uFE0F]+", "", value)
     return value.strip(" \t|:—–-•")
 
 
@@ -90,7 +90,7 @@ def parse_price_list(text, initial_brand=None, return_brand=False):
     output, pending = [], None
     active_brand = initial_brand
     number = r"(\d+(?:[.,]\d{1,2})?)"
-    currency = r"(?:\$|USD|EUR|RUB|₽|€)"
+    currency = r"(?:\$|USD|EUR|RUB|₽|€)?"
     # The trailing eSIM note is product information, not part of the price.
     trailing = r"(?:\s*\((?:e\s*sim|sim\s*\+\s*esim|dual\s*sim)\))?"
     priced = re.compile(rf"^(.+?)\s*[-—–:]\s*[$€₽]?\s*{number}\s*{currency}{trailing}\s*$", re.I)
