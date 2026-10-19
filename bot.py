@@ -56,20 +56,43 @@ async def authorize(update):
     return False
 
 
+def _clean_price_name(value):
+    # Remove decorative symbols, not letters or meaningful model attributes.
+    value = re.sub(r"^[\s•▪▫🔹🔸✅☑️📱📦💎🔥⭐️✨➖➡️—–-]+", "", value)
+    return value.strip(" \t|:—–-•")
+
+
+def multipart_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Закончить и проверить", callback_data="parts:finish")],
+        [InlineKeyboardButton("❌ Отменить сбор", callback_data="parts:cancel")],
+    ])
+
+
+def multipart_start_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 Загрузить прайс частями", callback_data="parts:start")],
+    ])
+
+
 def parse_price_list(text):
     lines = [x.strip(" *\\\t\r") for x in html.unescape(text).splitlines()]
     lines = [x for x in lines if x]
     output, pending = [], None
     number = r"\d+(?:[.,]\d{1,2})?"
     for line in lines:
-        if re.fullmatch(number, line):
+        # Emoji separators used by suppliers: "iPhone ... 💰 950$".
+        price_only = re.fullmatch(rf"(?:💰|💵|💲|🏷️|➡️|[:：])?\s*[$€₽]?\s*({number})\s*(?:\$|USD|EUR|RUB|₽|€)?", line, re.I)
+        if price_only:
             if pending:
-                output.append((pending, line))
+                output.append((_clean_price_name(pending), price_only.group(1)))
                 pending = None
             continue
-        match = re.fullmatch(rf"(.+?)\s+({number})\s*(?:\$|USD)?", line, re.I)
+        match = re.fullmatch(rf"(.+?)\s+(?:💰|💵|💲|🏷️|➡️|[:：])?\s*[$€₽]?\s*({number})\s*(?:\$|USD|EUR|RUB|₽|€)?", line, re.I)
         if match:
-            output.append((match.group(1).strip(), match.group(2)))
+            name = _clean_price_name(match.group(1))
+            if name:
+                output.append((name, match.group(2)))
             pending = None
         else:
             pending = line
@@ -80,7 +103,8 @@ def mode_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Авто", callback_data="mode:auto"),
          InlineKeyboardButton("🔎 Поиск", callback_data="mode:search")],
-        [InlineKeyboardButton("📥 Загрузка прайса", callback_data="mode:import")],
+        [InlineKeyboardButton("📥 Загрузка прайса", callback_data="mode:import"),
+         InlineKeyboardButton("📚 Прайс частями", callback_data="parts:start")],
         [InlineKeyboardButton("👥 Поставщики", callback_data="nav:suppliers"),
          InlineKeyboardButton("⚙️ Настройки", callback_data="nav:settings")],
     ])
@@ -164,7 +188,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/find iPhone 17 Pro 256GB Black — сравнить поставщиков\n"
         "/menu — меню и режим работы\n"
         "Просто напиши название товара — бот выполнит поиск.\n"
-        "Прайсы с ценами бот предложит сохранить.",
+        "Прайсы с ценами бот предложит сохранить.\n"
+        "Для длинного текстового прайса выбери 📚 Прайс частями.",
         reply_markup=mode_keyboard(),
     )
 
@@ -417,7 +442,39 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     action = query.data or ''
-    if action.startswith('mode:'):
+    if action == 'parts:start':
+        sid = context.user_data.get('supplier_id')
+        supplier = get_supplier(sid) if sid else None
+        if not supplier:
+            await query.message.reply_text('Сначала выбери поставщика через /suppliers.')
+            return
+        if context.user_data.get('parts'):
+            await query.message.reply_text('Сбор прайса уже идёт. Отправляй следующие части или заверши его.', reply_markup=multipart_keyboard())
+            return
+        context.user_data['parts'] = {'supplier_id': sid, 'rows': [], 'messages': 0, 'started': time.time()}
+        context.user_data.pop('pending', None)
+        context.user_data.pop('undecided_text', None)
+        await query.message.reply_text(
+            f'📚 Сбор текстового прайса для «{supplier["name"]}».\n'
+            'Отправляй части отдельными сообщениями, включая эмодзи. '
+            'Ничего не сохраняется до подтверждения.\n'
+            'После последней части нажми «Закончить и проверить».',
+            reply_markup=multipart_keyboard())
+    elif action == 'parts:cancel':
+        context.user_data.pop('parts', None)
+        await query.message.reply_text('❌ Сбор отменён. Текущий прайс поставщика не изменился.')
+    elif action == 'parts:finish':
+        batch = context.user_data.get('parts')
+        if not batch or not batch['rows']:
+            await query.message.reply_text('Нет собранных товаров. Пришли части прайса или отменяй сбор.')
+            return
+        if context.user_data.get('supplier_id') != batch['supplier_id']:
+            await query.message.reply_text('Выбран другой поставщик. Верни прежнего или отмени сбор.')
+            return
+        context.user_data['pending'] = list(batch['rows'])
+        context.user_data.pop('parts', None)
+        await show_pending(query.message, context)
+    elif action.startswith('mode:'):
         mode_name = action.split(':', 1)[1]
         if mode_name not in ('auto', 'search', 'import'):
             return
@@ -456,6 +513,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Введи название нового поставщика одним сообщением.")
     elif action.startswith('pick:'):
         sid = int(action.split(':')[1])
+        if context.user_data.get('parts') and context.user_data['parts']['supplier_id'] != sid:
+            await query.message.reply_text('Сначала заверши или отмени сбор прайса для текущего поставщика.', reply_markup=multipart_keyboard())
+            return
         s = get_supplier(sid)
         if not s:
             await query.message.reply_text("Поставщик не найден")
@@ -631,6 +691,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f'✅ Поставщик «{text}» добавлен/выбран.')
         await show_pending(update.effective_message, context)
         return
+    batch = context.user_data.get('parts')
+    if batch is not None:
+        if batch['supplier_id'] != context.user_data.get('supplier_id'):
+            await update.effective_message.reply_text('Сбор относится к другому поставщику. Отмени сбор и начни заново.', reply_markup=multipart_keyboard())
+            return
+        if batch['messages'] >= 100 or len(batch['rows']) >= 20000:
+            await update.effective_message.reply_text('Достигнут лимит частей/строк. Заверши текущий сбор.', reply_markup=multipart_keyboard())
+            return
+        rows = parse_price_list(text)
+        if not rows:
+            await update.effective_message.reply_text('В этой части не удалось распознать пары «товар — цена». Часть не добавлена. Проверь формат и отправь снова.', reply_markup=multipart_keyboard())
+            return
+        batch['rows'].extend(rows)
+        batch['messages'] += 1
+        await update.effective_message.reply_text(
+            f'✅ Часть {batch["messages"]} принята: {len(rows)} строк. '
+            f'Всего накоплено: {len(batch["rows"])} строк.\n'
+            'Отправляй следующую часть или заверши сбор.', reply_markup=multipart_keyboard())
+        return
     current_mode = context.user_data.get('mode', 'auto')
     if current_mode == 'search':
         await run_search(update.effective_message, text)
@@ -666,6 +745,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
+        return
+    if context.user_data.get('parts'):
+        await update.effective_message.reply_text('Сначала заверши или отмени сбор текстового прайса. Excel не будет импортирован во время сбора.', reply_markup=multipart_keyboard())
         return
     doc = update.effective_message.document
     if not doc or not doc.file_name.lower().endswith('.xlsx'):
