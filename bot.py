@@ -846,33 +846,32 @@ def _search_normalize(text):
 def _offer_matches(query, requested, offer):
     original = offer['original_name']
     found = parse_product(original)
-    # A compatible phone model inside an accessory name is not the phone itself.
-    # An explicit accessory query must not return a bare phone either.
     if requested['is_accessory'] != found['is_accessory']:
         return False
-    # Parse from original name even when older database entries have no model.
+
     query_model = requested.get('model')
+    # A stored, explicitly recognized model is valid even if the original text
+    # is an abbreviation. This supports older rows that retain structured data.
     found_model = found.get('model') or offer.get('model')
     if query_model:
-        if found_model:
-            if query_model.casefold() != found_model.casefold():
-                return False
-        elif not all(t in _search_normalize(original) for t in _search_normalize(query)):
+        if not found_model and query_model.startswith('iPhone '):
+            # A bare "17 Pro" could be iPhone *or* Redmi. Only infer Apple
+            # for a supplier explicitly designated as Apple-only; never infer
+            # it from a matching number alone.
+            if _supplier_default_brand(offer.get('supplier_id')) == 'Apple':
+                inferred = contextual_name(original, 'Apple')
+                found = parse_product(inferred)
+                found_model = found.get('model')
+        if not found_model or query_model.casefold() != found_model.casefold():
             return False
-        # Never include Pro Max when the search is for Pro (or vice versa),
-        # even if a legacy parser failed to recognize the source model.
-        if query_model.startswith('iPhone ') and not found_model:
-            text_model = __import__('product_parser').detect_iphone(original)
-            if text_model != query_model:
-                return False
     else:
         if not all(t in _search_normalize(original) for t in _search_normalize(query)):
             return False
+
     for field in ('storage_gb', 'ram_gb', 'color', 'region', 'sim'):
         required = requested.get(field)
         if required is not None and (found.get(field) or offer.get(field)) != required:
             return False
-    # Explicit product variants (e.g. Air) never leak into base-model results.
     return True
 
 
