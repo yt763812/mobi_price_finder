@@ -16,7 +16,7 @@ from database import (
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
     get_excel_profiles, save_excel_profiles,
 )
-from product_parser import parse_product
+from product_parser import parse_product, section_brand, contextual_name
 from excel_importer import (inspect_xlsx, extract_xlsx, MAX_FILE_BYTES,
                             sheet_columns, inspect_mapping, sheet_fingerprint)
 
@@ -62,6 +62,12 @@ def _clean_price_name(value):
     return value.strip(" \t|:—–-•")
 
 
+def _supplier_default_brand(supplier_id):
+    """Optional Apple-only supplier IDs, e.g. APPLE_ONLY_SUPPLIER_IDS=3,7."""
+    ids = set(re.findall(r"\d+", os.getenv('APPLE_ONLY_SUPPLIER_IDS', '')))
+    return 'Apple' if str(supplier_id) in ids else None
+
+
 def multipart_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Закончить и проверить", callback_data="parts:finish")],
@@ -75,28 +81,34 @@ def multipart_start_keyboard():
     ])
 
 
-def parse_price_list(text):
+def parse_price_list(text, initial_brand=None, return_brand=False):
     lines = [x.strip(" *\\\t\r") for x in html.unescape(text).splitlines()]
     lines = [x for x in lines if x]
     output, pending = [], None
+    active_brand = initial_brand
     number = r"\d+(?:[.,]\d{1,2})?"
     for line in lines:
+        heading = section_brand(line)
+        if heading:
+            active_brand = heading
+            pending = None
+            continue
         # Emoji separators used by suppliers: "iPhone ... 💰 950$".
         price_only = re.fullmatch(rf"(?:💰|💵|💲|🏷️|➡️|[:：])?\s*[$€₽]?\s*({number})\s*(?:\$|USD|EUR|RUB|₽|€)?", line, re.I)
         if price_only:
             if pending:
-                output.append((_clean_price_name(pending), price_only.group(1)))
+                output.append((contextual_name(_clean_price_name(pending), active_brand), price_only.group(1)))
                 pending = None
             continue
         match = re.fullmatch(rf"(.+?)\s+(?:💰|💵|💲|🏷️|➡️|[:：])?\s*[$€₽]?\s*({number})\s*(?:\$|USD|EUR|RUB|₽|€)?", line, re.I)
         if match:
             name = _clean_price_name(match.group(1))
             if name:
-                output.append((name, match.group(2)))
+                output.append((contextual_name(name, active_brand), match.group(2)))
             pending = None
         else:
             pending = line
-    return output
+    return (output, active_brand) if return_brand else output
 
 
 def mode_keyboard():
@@ -451,7 +463,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get('parts'):
             await query.message.reply_text('Сбор прайса уже идёт. Отправляй следующие части или заверши его.', reply_markup=multipart_keyboard())
             return
-        context.user_data['parts'] = {'supplier_id': sid, 'rows': [], 'messages': 0, 'started': time.time()}
+        context.user_data['parts'] = {'supplier_id': sid, 'rows': [], 'messages': 0, 'started': time.time(), 'brand': _supplier_default_brand(sid)}
         context.user_data.pop('pending', None)
         context.user_data.pop('undecided_text', None)
         await query.message.reply_text(
@@ -501,7 +513,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if decision == 'search':
             await run_search(query.message, raw)
         elif decision == 'import':
-            rows = parse_price_list(raw)
+            rows = parse_price_list(raw, _supplier_default_brand(context.user_data.get('supplier_id')))
             if not rows:
                 await query.message.reply_text('В сообщении нет распознанных пар «товар — цена».')
             else:
@@ -611,7 +623,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extracted, skipped = [], 0
             selected_items = [it for it in staged['sheets'] if it.get('enabled')]
             for selected in selected_items:
-                batch, missing = extract_xlsx(staged['data'], selected['sheet'], selected['mapping'], selected['header_row'])
+                batch, missing = extract_xlsx(staged['data'], selected['sheet'], selected['mapping'], selected['header_row'], default_brand=_supplier_default_brand(sid))
                 extracted.extend(batch)
                 skipped += missing
             parsed = [(parse_product(name), price) for name, price in extracted]
@@ -699,11 +711,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if batch['messages'] >= 100 or len(batch['rows']) >= 20000:
             await update.effective_message.reply_text('Достигнут лимит частей/строк. Заверши текущий сбор.', reply_markup=multipart_keyboard())
             return
-        rows = parse_price_list(text)
-        if not rows:
+        rows, next_brand = parse_price_list(text, batch.get('brand'), return_brand=True)
+        if not rows and next_brand == batch.get('brand'):
             await update.effective_message.reply_text('В этой части не удалось распознать пары «товар — цена». Часть не добавлена. Проверь формат и отправь снова.', reply_markup=multipart_keyboard())
             return
         batch['rows'].extend(rows)
+        batch['brand'] = next_brand
         batch['messages'] += 1
         await update.effective_message.reply_text(
             f'✅ Часть {batch["messages"]} принята: {len(rows)} строк. '
@@ -715,7 +728,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await run_search(update.effective_message, text)
         return
 
-    rows = parse_price_list(text)
+    rows = parse_price_list(text, _supplier_default_brand(context.user_data.get('supplier_id')))
     if current_mode == 'import':
         if not rows:
             await update.effective_message.reply_text(
