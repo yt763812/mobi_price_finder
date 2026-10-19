@@ -36,6 +36,7 @@ def init_db():
             """)
             cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'UNKNOWN'")
             cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS tax_status TEXT NOT NULL DEFAULT 'unknown'")
+            cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS last_price_import_at TIMESTAMPTZ")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS offers (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -215,14 +216,14 @@ def list_suppliers():
     """Show registered suppliers without exposing database credentials."""
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, validity_hours, currency, tax_status FROM suppliers ORDER BY name")
+            cur.execute("SELECT id, name, validity_hours, currency, tax_status, last_price_import_at FROM suppliers ORDER BY name")
             return cur.fetchall()
 
 
 def get_supplier(supplier_id):
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, validity_hours, currency, tax_status FROM suppliers WHERE id=%s", (supplier_id,))
+            cur.execute("SELECT id, name, validity_hours, currency, tax_status, last_price_import_at FROM suppliers WHERE id=%s", (supplier_id,))
             return cur.fetchone()
 
 
@@ -327,6 +328,8 @@ def _replace_supplier_offers(supplier_id, rows, currency=None, tax_status=None):
                       json.dumps(product.get('condition') or [], ensure_ascii=False),
                       json.dumps(product.get('warnings') or [], ensure_ascii=False),
                       product.get('ram_gb'), amount, currency, tax_status))
+            # Same transaction as the snapshot: a failed import cannot move the timestamp.
+            cur.execute('UPDATE suppliers SET last_price_import_at = now() WHERE id = %s', (supplier_id,))
     return {'saved': len(unique), 'skipped': len(rejected),
             'duplicates': len(rows) - len(unique) - len(rejected),
             'rejected': rejected[:5],
