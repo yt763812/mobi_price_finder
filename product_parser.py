@@ -98,6 +98,7 @@ def detect_iphone(text):
 
 def detect_region(text):
     flags = [name for flag, name in REGION_FLAGS.items() if flag in text]
+    flags += [country_from_flag(m.group(0)) for m in re.finditer(r"[\U0001F1E6-\U0001F1FF]{2}", text) if country_from_flag(m.group(0))]
     if flags:
         return flags[0] if len(set(flags)) == 1 else None
     t = normalize(text)
@@ -170,6 +171,7 @@ DEVICE_PATTERNS = [
 EXTRA_FAMILIES = [
     ("Huawei", r"huawei\s+(mate\s*(?:xt|x[0-9]+|[0-9]+)(?:\s*(?:pro\s*max|pro|rs|x|s))?|pura\s*[0-9]+(?:\s*(?:ultra|pro|plus))?|nova\s*[0-9]+(?:\s*(?:pro|ultra|se))?)"),
     ("Sony", r"sony\s+(xperia\s*(?:1|5|10)\s*(?:viii|vii|vi|v|iv|iii|ii|i|[0-9]+))"),
+    ("Redmi", r"redmi\s+[0-9]+(?:\s*(?:pro\s*max|pro|plus|ultra))?"),
     ("Xiaomi", r"xiaomi\s+(mix\s*(?:flip|fold)\s*[0-9]*|redmi\s*[0-9]+[a-z]?(?:\s*(?:4g|5g|pro|plus))?|pad\s*[0-9]+(?:\s*pro)?)"),
     ("Samsung", r"samsung\s+(?:galaxy\s+)?(a[0-9]{2}[a-z]?(?:\s*(?:4g|5g))?|tab\s+[a-z][0-9]+(?:\s*(?:ultra|plus|fe))?)"),
     ("HONOR", r"honor\s+(magic\s*(?:v[0-9]+|[0-9]+)(?:\s*(?:pro|lite|ultimate))?|[0-9]{2,3}[a-z]?(?:\s*(?:pro|lite|5g))?)"),
@@ -231,6 +233,52 @@ def detect_sku(text):
     """Extract only explicitly bracketed product codes; no speculative SKU guesses."""
     matches = re.findall(r"\[([A-Za-z0-9][A-Za-z0-9 /._-]{3,35})\]", text)
     return matches[0].strip() if matches else None
+
+
+# Brand/category headings are whole lines without prices; never guess from arbitrary prose.
+SECTION_BRANDS = {'apple': 'Apple', 'iphone': 'Apple', 'samsung': 'Samsung',
+                  'xiaomi': 'Xiaomi', 'redmi': 'Redmi', 'poco': 'POCO'}
+
+
+def section_brand(text):
+    cleaned = re.sub(r"[\s:—–\-]+$", "", str(text).strip()).casefold()
+    return SECTION_BRANDS.get(cleaned)
+
+
+def contextual_name(name, brand=None):
+    """Canonicalize *only* recognizable abbreviated devices; leave unknown lines intact."""
+    name = str(name).strip()
+    if not name:
+        return name
+    t = normalize(name)
+    # Any explicit brand takes precedence over a section/default supplier brand.
+    if re.search(r"(?<!\w)(?:iphone|айфон|apple|samsung|galaxy|redmi|xiaomi|poco|pixel|google|honor|huawei)(?!\w)", t):
+        # 'Apple 17 Pro' is itself an abbreviation, not an explicit iPhone.
+        if re.match(r"^apple\s+\d{1,2}(?:\s|$)", t):
+            return 'iPhone ' + re.sub(r'^apple\s+', '', name, flags=re.I)
+        return name
+    if brand == 'Apple':
+        if re.match(r"^\d{1,2}\s*(?:pro\s*max|promax|pro|plus|mini|air)?(?:\s|$)", t):
+            return 'iPhone ' + name
+    elif brand == 'Samsung':
+        if re.match(r"^(?:s(?:2[0-9]|3[0-9])|a\d{2}|z\s*(?:flip|fold)\s*\d+)(?:\b|\s)", t):
+            return 'Samsung ' + name
+    elif brand in ('Redmi', 'Xiaomi'):
+        if re.match(r"^\d{1,2}(?:\s+(?:pro|ultra|plus|pro\s*max))?(?:\s|$)", t):
+            return brand + ' ' + name
+    return name
+
+
+def country_from_flag(flag):
+    """Decode ordinary Unicode regional-indicator flags without third-party data."""
+    chars = list(flag)
+    if len(chars) != 2 or not all(0x1F1E6 <= ord(c) <= 0x1F1FF for c in chars):
+        return None
+    country = ''.join(chr(ord(c) - 0x1F1E6 + ord('A')) for c in chars)
+    common = {'US': 'USA', 'JP': 'Japan', 'HK': 'Hong Kong', 'AE': 'UAE',
+              'CN': 'China', 'GB': 'UK', 'AU': 'Australia', 'SG': 'Singapore',
+              'IN': 'India', 'KR': 'South Korea', 'CA': 'Canada', 'EU': 'EU'}
+    return common.get(country, country)
 
 
 def parse_product(text):
