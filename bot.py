@@ -914,12 +914,24 @@ def format_offer(offer, index):
             f"Состояние: {condition_label}")
 
 
+def _interpret_search_query(query_text):
+    """Short iPhone-style queries default to iPhone, never to Redmi/Xiaomi.
+
+    An explicit brand always wins. Other bare model families (e.g. S25) keep
+    their existing behavior. Matching still requires a recognized iPhone model.
+    """
+    compact = re.sub(r"\s+", " ", query_text.strip())
+    if re.match(r"^\d{1,2}\s+(?:pro\s*max|promax|pro|plus|mini|air)(?=\s|$)", compact, re.I):
+        return "iPhone " + compact
+    return compact
+
+
 async def run_search(message, query_text):
     query_text = query_text.strip()
     if not query_text:
         await message.reply_text('Напиши название товара для поиска.')
         return
-    requested = parse_product(query_text)
+    requested = parse_product(_interpret_search_query(query_text))
     matches = [o for o in search_offers()
                if o['is_fresh'] and _offer_matches(query_text, requested, o)]
     if not matches:
