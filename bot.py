@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import hashlib
+from io import BytesIO
+from datetime import datetime
 import time
 from datetime import timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -16,7 +18,7 @@ from telegram.ext import (
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
-    get_excel_profiles, save_excel_profiles,
+    get_excel_profiles, save_excel_profiles, export_supplier_offers,
 )
 from product_parser import parse_product, section_brand, contextual_name
 from excel_importer import (inspect_xlsx, extract_xlsx, MAX_FILE_BYTES,
@@ -219,6 +221,7 @@ def supplier_manage_keyboard(supplier, can_delete=True):
     if can_delete:
         buttons.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"supplier:delete:{sid}")])
     buttons += [
+        [InlineKeyboardButton("📥 Выгрузить прайс (Excel)", callback_data=f"supplier:export:{sid}")],
         [InlineKeyboardButton("⚙️ Валюта и НДС", callback_data=f"supplier:settings:{sid}")],
         [InlineKeyboardButton("👥 Все поставщики", callback_data="nav:suppliers")],
     ]
@@ -509,6 +512,107 @@ async def excel_manual_callback(query, context, action):
         await query.message.reply_text(f'✅ {item["sheet"]}: найдено {info["valid"]} предложений.', reply_markup=excel_menu(stage))
 
 
+def _audit_cell(value):
+    """Prevent an imported supplier name from becoming an Excel formula."""
+    if value is None:
+        return 'Не указан'
+    if isinstance(value, str):
+        value = value.strip()
+        return "'" + value if value.startswith(('=', '+', '-', '@')) else (value or 'Не указан')
+    return value
+
+
+def _build_supplier_export(supplier, offers):
+    """Build an XLSX audit of DB state, including parsed view and raw fields."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    workbook = Workbook()
+    all_sheet = workbook.active
+    all_sheet.title = 'Все товары'
+    check_sheet = workbook.create_sheet('Проверка')
+    headers = [
+        'ID записи', 'Исходное название (БД)', 'Модель в поиске', 'Бренд',
+        'Память, GB', 'RAM, GB', 'Цвет', 'Регион', 'SIM', 'Состояние',
+        'Цена', 'Валюта', 'НДС', 'Обновлён', 'Актуален',
+        'Модель сохранена в БД', 'Цвет сохранён в БД', 'Регион сохранён в БД',
+        'SIM сохранён в БД', 'Предупреждения БД',
+    ]
+    check_headers = ['ID записи', 'Исходное название', 'Причина проверки', 'Цена', 'Валюта']
+    all_sheet.append(headers)
+    check_sheet.append(check_headers)
+    vat_labels = {'with_vat': 'С НДС', 'without_vat': 'Без НДС', 'unknown': 'Не указан'}
+    for offer in offers:
+        parsed = parse_product(offer['original_name'])
+        def effective(key):
+            value = parsed.get(key)
+            return value if value is not None and value != [] and value != '' else offer.get(key)
+        conditions = parsed.get('condition') or offer.get('condition_tags') or []
+        if isinstance(conditions, str):
+            conditions = [conditions]
+        condition_labels = {'activated': 'Активирован', 'sealed': 'Запечатан',
+                            'refurbished': 'Восстановлен', 'used': 'Б/у'}
+        status = ', '.join(condition_labels.get(str(c), str(c)) for c in conditions) or 'Не указано'
+        date = offer.get('updated_at')
+        if date and date.tzinfo:
+            date = date.astimezone(ZoneInfo(os.getenv('PRICE_TIMEZONE', 'Europe/Moscow'))).replace(tzinfo=None)
+        price = float(offer['price']) if offer.get('price') is not None else None
+        row = [
+            offer['id'], _audit_cell(offer['original_name']), _audit_cell(effective('model')),
+            _audit_cell(effective('brand')), effective('storage_gb'), effective('ram_gb'),
+            _audit_cell(effective('color')), _audit_cell(effective('region')),
+            _audit_cell(effective('sim')), status, price, offer.get('currency'),
+            vat_labels.get(offer.get('tax_status'), 'Не указан'), date,
+            'Да' if offer.get('is_fresh') else 'Нет',
+            _audit_cell(offer.get('model')), _audit_cell(offer.get('color')),
+            _audit_cell(offer.get('region')), _audit_cell(offer.get('sim')),
+            '; '.join(str(x) for x in (offer.get('warnings') or [])),
+        ]
+        all_sheet.append(row)
+        reasons = []
+        if not effective('model'):
+            reasons.append('Модель не распознана')
+        if price is None or price <= 0:
+            reasons.append('Некорректная или отсутствующая цена')
+        if price is not None and price < 50:
+            reasons.append('Цена ниже 50 — проверь, если это не аксессуар')
+        if not offer.get('is_fresh'):
+            reasons.append('Предложение устарело')
+        if parsed.get('model') and offer.get('model') and parsed['model'] != offer['model']:
+            reasons.append('Модель из текста отличается от сохранённой')
+        reasons += [str(w) for w in (offer.get('warnings') or [])]
+        if reasons:
+            check_sheet.append([offer['id'], _audit_cell(offer['original_name']),
+                                '; '.join(reasons), price, offer.get('currency')])
+
+    for sheet, widths, price_col in [
+        (all_sheet, [13, 70, 29, 17, 15, 14, 22, 21, 18, 20, 16, 13, 16, 22, 12, 29, 22, 21, 18, 50], 11),
+        (check_sheet, [13, 75, 65, 16, 14], 4),
+    ]:
+        sheet.freeze_panes = 'C2' if sheet is all_sheet else 'B2'
+        sheet.auto_filter.ref = sheet.dimensions
+        sheet.row_dimensions[1].height = 28
+        for cell in sheet[1]:
+            cell.fill = PatternFill('solid', fgColor='17365D')
+            cell.font = Font(color='FFFFFF', bold=True)
+            cell.alignment = Alignment(vertical='center', wrap_text=True)
+        for col, width in enumerate(widths, 1):
+            sheet.column_dimensions[get_column_letter(col)].width = width
+        for row in sheet.iter_rows(min_row=2):
+            if row[0].row % 2 == 0:
+                for cell in row:
+                    cell.fill = PatternFill('solid', fgColor='F1F6FA')
+            row[price_col - 1].number_format = '#,##0.00'
+        if sheet is all_sheet:
+            for cell in sheet['N'][1:]:
+                cell.number_format = 'DD.MM.YYYY HH:MM'
+    data = BytesIO()
+    workbook.save(data)
+    data.seek(0)
+    return data, check_sheet.max_row - 1
+
+
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not allowed(update):
@@ -609,7 +713,25 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not s:
             await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
             return
-        if operation == 'rename':
+        if operation == 'export':
+            try:
+                offers = export_supplier_offers(sid)
+                if not offers:
+                    await query.message.reply_text('У этого поставщика пока нет сохранённых товаров.')
+                    return
+                file_buffer, review_count = _build_supplier_export(s, offers)
+                file_name = f'pricefinder_supplier_{sid}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
+                await query.message.reply_document(
+                    document=file_buffer, filename=file_name,
+                    caption=(f'📥 Выгрузка из PostgreSQL: {s["name"]}\n'
+                             f'Товаров: {len(offers)}\n'
+                             f'Позиций для проверки: {review_count}\n'
+                             'Показаны все сохранённые товары, включая устаревшие.'),
+                )
+            except Exception:
+                logger.exception('Failed to export supplier %s', sid)
+                await query.message.reply_text('Не удалось выгрузить прайс. Проверь логи Railway.')
+        elif operation == 'rename':
             context.user_data.pop('await_name', None)
             context.user_data['await_rename_id'] = sid
             await query.message.reply_text(
