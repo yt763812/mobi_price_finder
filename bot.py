@@ -957,19 +957,36 @@ async def run_search(message, query_text):
     if not matches:
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
         return
-    # Do not rank different currencies/VAT modes as if they are comparable.
+    # Currency/VAT groups cannot be compared on the same price scale.
+    # Apply the per-supplier cap across all groups, then cap the full output.
     groups = {}
     for offer in matches:
         groups.setdefault((offer['currency'], offer['tax_status']), []).append(offer)
-    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}']
-    index = 0
-    for (currency, tax), offers in sorted(groups.items()):
+
+    selected = []
+    supplier_counts = {}
+    for group_key, offers in sorted(groups.items()):
         offers.sort(key=lambda o: (o['price'], o['supplier_name'].casefold()))
-        blocks.append(f'\n📊 {currency}, ' + {'with_vat':'с НДС', 'without_vat':'без НДС',
-                      'unknown':'НДС не указан'}.get(tax,'НДС не указан'))
         for offer in offers:
-            index += 1
-            blocks.append(format_offer(offer, index))
+            supplier_key = offer['supplier_id']
+            if supplier_counts.get(supplier_key, 0) >= 3:
+                continue
+            selected.append((group_key, offer))
+            supplier_counts[supplier_key] = supplier_counts.get(supplier_key, 0) + 1
+            if len(selected) >= 20:
+                break
+        if len(selected) >= 20:
+            break
+
+    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\nПоказано: {len(selected)} (не более 3 от поставщика)']
+    previous_group = None
+    for index, (group_key, offer) in enumerate(selected, 1):
+        if group_key != previous_group:
+            currency, tax = group_key
+            blocks.append(f'\n📊 {currency}, ' + {'with_vat':'с НДС', 'without_vat':'без НДС',
+                          'unknown':'НДС не указан'}.get(tax,'НДС не указан'))
+            previous_group = group_key
+        blocks.append(format_offer(offer, index))
     chunk = ''
     for block in blocks:
         if len(block) > 3700:
