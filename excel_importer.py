@@ -4,7 +4,7 @@ import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from collections import Counter
 from openpyxl import load_workbook
-from product_parser import parse_product
+from product_parser import parse_product, section_brand, contextual_name
 
 NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название товара', 'товар', 'product', 'model', 'item', 'description')
 PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб')
@@ -198,7 +198,7 @@ def inspect_xlsx(data):
         wb.close()
 
 
-def extract_xlsx(data, sheet_name, mapping, header_row):
+def extract_xlsx(data, sheet_name, mapping, header_row, default_brand=None):
     """Extract all validated rows from one explicitly selected sheet."""
     if len(data) > MAX_FILE_BYTES:
         raise ValueError('Файл слишком большой')
@@ -212,11 +212,16 @@ def extract_xlsx(data, sheet_name, mapping, header_row):
             raise ValueError('Столбец цены содержит почти одинаковые значения (возможно, дату прайса). Выбери правильный столбец.')
         rows = []
         skipped = 0
+        active_brand = default_brand
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
             def val(key):
                 i = mapping.get(key)
                 return row[i] if i is not None and i < len(row) else None
             name = _clean(val('name'))
+            heading = section_brand(name)
+            if heading and _price(val('price')) is None:
+                active_brand = heading
+                continue
             if not name or len(name) < 5:
                 continue
             amount = _price(val('price'))
@@ -224,7 +229,7 @@ def extract_xlsx(data, sheet_name, mapping, header_row):
                 skipped += 1
                 continue
             brand = _clean(val('brand'))
-            full_name = (brand + ' ' + name).strip() if brand and not name.casefold().startswith(brand.casefold() + ' ') else name
+            full_name = (brand + ' ' + name).strip() if brand and not name.casefold().startswith(brand.casefold() + ' ') else contextual_name(name, active_brand)
             # Keep extra attributes in the searchable name: database schema remains unchanged.
             for key in ('color', 'region'):
                 extra = _clean(val(key))
