@@ -236,12 +236,17 @@ def detect_sku(text):
 
 
 # Brand/category headings are whole lines without prices; never guess from arbitrary prose.
-SECTION_BRANDS = {'apple': 'Apple', 'iphone': 'Apple', 'samsung': 'Samsung',
+SECTION_BRANDS = {'apple': 'Apple', 'iphone': 'Apple', 'iphones': 'Apple', 'айфоны': 'Apple', 'samsung': 'Samsung',
                   'xiaomi': 'Xiaomi', 'redmi': 'Redmi', 'poco': 'POCO'}
 
 
 def section_brand(text):
-    cleaned = re.sub(r"[\s:—–\-]+$", "", str(text).strip()).casefold()
+    # Section headings may contain emoji, a colon and Telegram's pasted Markdown.
+    cleaned = str(text).casefold().replace('ё', 'е')
+    cleaned = re.sub(r'[\uFE0E\uFE0F\u200D]', '', cleaned)
+    cleaned = re.sub(r'^[\s*_*`]+|[\s*_*`]+$', '', cleaned)
+    cleaned = re.sub(r'[📱⌚💻📦:：\s*_*`—–-]+$', '', cleaned).strip()
+    cleaned = re.sub(r'^[📱⌚💻📦\s*_*`]+', '', cleaned).strip()
     return SECTION_BRANDS.get(cleaned)
 
 
