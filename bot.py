@@ -82,32 +82,53 @@ def multipart_start_keyboard():
 
 
 def parse_price_list(text, initial_brand=None, return_brand=False):
-    lines = [x.strip(" *\\\t\r") for x in html.unescape(text).splitlines()]
-    lines = [x for x in lines if x]
+    """Read Telegram supplier messages with headings, flags and price annotations.
+
+    Keep a canonical name (e.g. 'iPhone 17 Pro') so search can distinguish
+    Apple devices from similarly named Xiaomi/Redmi products.
+    """
     output, pending = [], None
     active_brand = initial_brand
-    number = r"\d+(?:[.,]\d{1,2})?"
-    for line in lines:
+    number = r"(\d+(?:[.,]\d{1,2})?)"
+    currency = r"(?:\$|USD|EUR|RUB|₽|€)"
+    # The trailing eSIM note is product information, not part of the price.
+    trailing = r"(?:\s*\((?:e\s*sim|sim\s*\+\s*esim|dual\s*sim)\))?"
+    priced = re.compile(rf"^(.+?)\s*[-—–:]\s*[$€₽]?\s*{number}\s*{currency}{trailing}\s*$", re.I)
+    standalone = re.compile(rf"^[$€₽]?\s*{number}\s*{currency}{trailing}\s*$", re.I)
+    for raw in html.unescape(text).splitlines():
+        line = raw.strip().strip('*_`\\ ').strip()
+        if not line:
+            continue
         heading = section_brand(line)
         if heading:
             active_brand = heading
             pending = None
             continue
-        # Emoji separators used by suppliers: "iPhone ... 💰 950$".
-        price_only = re.fullmatch(rf"(?:💰|💵|💲|🏷️|➡️|[:：])?\s*[$€₽]?\s*({number})\s*(?:\$|USD|EUR|RUB|₽|€)?", line, re.I)
-        if price_only:
-            if pending:
-                output.append((contextual_name(_clean_price_name(pending), active_brand), price_only.group(1)))
-                pending = None
+        # A model-only heading like '18 Pro/Pro Max 📱📱:' remains in Apple section.
+        if re.fullmatch(r'[0-9]{1,2}\s+Pro\s*/\s*Pro\s*Max\s*📱*\s*:', line, re.I):
             continue
-        match = re.fullmatch(rf"(.+?)\s+(?:💰|💵|💲|🏷️|➡️|[:：])?\s*[$€₽]?\s*({number})\s*(?:\$|USD|EUR|RUB|₽|€)?", line, re.I)
+        # Remove Markdown fragments copied from formatted Telegram messages.
+        line = line.replace('**', '').replace('\u00a0', ' ').strip()
+        match = priced.fullmatch(line)
         if match:
             name = _clean_price_name(match.group(1))
+            # Parenthesized eSIM info is crucial to search and display.
+            suffix = re.search(r'\(e\s*sim\)', line, re.I)
+            if suffix and not re.search(r'\besim\b', name, re.I):
+                name += ' eSIM'
             if name:
                 output.append((contextual_name(name, active_brand), match.group(2)))
             pending = None
-        else:
-            pending = line
+            continue
+        match = standalone.fullmatch(line)
+        if match and pending:
+            output.append((contextual_name(_clean_price_name(pending), active_brand), match.group(1)))
+            pending = None
+            continue
+        # Avoid treating category labels as product names.
+        if re.fullmatch(r'[—–\-_=📱⌚💻\s]+', line):
+            continue
+        pending = line
     return (output, active_brand) if return_brand else output
 
 
