@@ -152,12 +152,52 @@ def parse_price_list(text, initial_brand=None, return_brand=False):
     return (output, active_brand) if return_brand else output
 
 
+def auto_draft_keyboard(draft):
+    revision = draft['revision']
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Сохранить общий прайс", callback_data=f"draft:save:{revision}")],
+        [InlineKeyboardButton("❌ Отменить сбор", callback_data=f"draft:cancel:{revision}")],
+    ])
+
+
+def append_to_auto_draft(context, supplier_id, incoming):
+    """Reparse complete joined text so headings and broken line boundaries survive."""
+    draft = context.user_data.get('auto_draft')
+    if draft and draft['supplier_id'] != supplier_id:
+        raise ValueError('Сначала сохрани или отмени черновик другого поставщика.')
+    if draft is None:
+        draft = {'supplier_id': supplier_id, 'messages': [], 'revision': 0, 'rows': []}
+    if len(draft['messages']) >= 100 or sum(map(len, draft['messages'])) + len(incoming) > 800_000:
+        raise ValueError('Достигнут лимит черновика. Сохрани его или отмени.')
+    if incoming in draft['messages']:
+        return draft, False
+    messages = draft['messages'] + [incoming]
+    joined = '\n'.join(messages)
+    rows = parse_price_list(joined, _supplier_default_brand(supplier_id))
+    if len(rows) > 25_000:
+        raise ValueError('Слишком много товарных строк в черновике.')
+    draft.update(messages=messages, rows=rows, revision=draft['revision'] + 1)
+    context.user_data['auto_draft'] = draft
+    context.user_data.pop('pending', None)
+    context.user_data.pop('undecided_text', None)
+    return draft, True
+
+
+async def auto_draft_status(message, draft):
+    await message.reply_text(
+        f"📥 Черновик прайса: {len(draft['messages'])} сообщ.\n"
+        f"Распознано строк с ценой: {len(draft['rows'])}.\n"
+        "Можешь отправить следующие сообщения. Когда всё пришло, нажми «Сохранить общий прайс». "
+        "До нажатия данные в базе не изменятся.",
+        reply_markup=auto_draft_keyboard(draft),
+    )
+
+
 def mode_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Авто", callback_data="mode:auto"),
          InlineKeyboardButton("🔎 Поиск", callback_data="mode:search")],
-        [InlineKeyboardButton("📥 Загрузка прайса", callback_data="mode:import"),
-         InlineKeyboardButton("📚 Прайс частями", callback_data="parts:start")],
+        [InlineKeyboardButton("📥 Загрузка прайса", callback_data="mode:import")],
         [InlineKeyboardButton("👥 Поставщики", callback_data="nav:suppliers"),
          InlineKeyboardButton("⚙️ Настройки", callback_data="nav:settings")],
     ])
@@ -620,6 +660,37 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     action = query.data or ''
+    if action.startswith('draft:'):
+        op, revision_raw = action.split(':')[1:]
+        draft = context.user_data.get('auto_draft')
+        if not draft or not revision_raw.isdigit() or int(revision_raw) != draft['revision']:
+            await query.message.reply_text('Кнопка устарела: используй кнопки в последнем сообщении о черновике.')
+            return
+        if op == 'cancel':
+            context.user_data.pop('auto_draft', None)
+            await query.message.reply_text('❌ Черновик отменён. Сохранённый прайс не изменён.')
+        elif op == 'save':
+            sid = context.user_data.get('supplier_id')
+            if sid != draft['supplier_id'] or not get_supplier(sid):
+                await query.message.reply_text('Поставщик изменён. Выбери прежнего поставщика.')
+                return
+            if not draft['rows']:
+                await query.message.reply_text('Нет распознанных товаров. Прайс не заменён.')
+                return
+            try:
+                parsed = [(parse_product(name), price) for name, price in draft['rows']]
+                summary = save_price_list(sid, parsed)
+            except Exception:
+                logger.exception('Failed to save auto draft')
+                await query.message.reply_text('❌ Ошибка сохранения. Старый прайс должен остаться без изменений. Проверь Railway Logs.')
+                return
+            context.user_data.pop('auto_draft', None)
+            await query.message.reply_text(
+                f"✅ Общий прайс сохранён!\nСообщений: {len(draft['messages'])}\n"
+                f"Конфигураций: {summary['saved']}\nДубли: {summary['duplicates']}\n"
+                f"Пропущено: {summary['skipped']}\nСтарый прайс поставщика заменён."
+            )
+        return
     if action == 'parts:start':
         sid = context.user_data.get('supplier_id')
         supplier = get_supplier(sid) if sid else None
@@ -683,14 +754,25 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not rows:
                 await query.message.reply_text('В сообщении нет распознанных пар «товар — цена».')
             else:
-                context.user_data['pending'] = rows
-                await show_pending(query.message, context)
+                sid = context.user_data.get('supplier_id')
+                if not sid or not get_supplier(sid):
+                    await query.message.reply_text('Сначала выбери поставщика через /suppliers.')
+                    return
+                try:
+                    draft, _ = append_to_auto_draft(context, sid, raw)
+                except ValueError as exc:
+                    await query.message.reply_text(str(exc))
+                    return
+                await auto_draft_status(query.message, draft)
     elif action == 'supplier:new':
         context.user_data.pop('await_rename_id', None)
         context.user_data['await_name'] = True
         await query.message.reply_text("Введи название нового поставщика одним сообщением.")
     elif action.startswith('pick:'):
         sid = int(action.split(':')[1])
+        if context.user_data.get('auto_draft') and context.user_data['auto_draft']['supplier_id'] != sid:
+            await query.message.reply_text('Сначала сохрани или отмени черновик текущего поставщика.', reply_markup=auto_draft_keyboard(context.user_data['auto_draft']))
+            return
         if context.user_data.get('parts') and context.user_data['parts']['supplier_id'] != sid:
             await query.message.reply_text('Сначала заверши или отмени сбор прайса для текущего поставщика.', reply_markup=multipart_keyboard())
             return
@@ -887,6 +969,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f'✅ Поставщик «{text}» добавлен/выбран.')
         await show_pending(update.effective_message, context)
         return
+    existing_draft = context.user_data.get('auto_draft')
+    if existing_draft is not None:
+        sid = context.user_data.get('supplier_id')
+        if sid != existing_draft['supplier_id']:
+            await update.effective_message.reply_text('Черновик относится к другому поставщику.', reply_markup=auto_draft_keyboard(existing_draft))
+            return
+        try:
+            draft, added = append_to_auto_draft(context, sid, text)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc), reply_markup=auto_draft_keyboard(existing_draft))
+            return
+        if added:
+            await auto_draft_status(update.effective_message, draft)
+        else:
+            await update.effective_message.reply_text('Такое сообщение уже есть в черновике.', reply_markup=auto_draft_keyboard(draft))
+        return
     batch = context.user_data.get('parts')
     if batch is not None:
         if batch['supplier_id'] != context.user_data.get('supplier_id'):
@@ -913,35 +1011,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     rows = parse_price_list(text, _supplier_default_brand(context.user_data.get('supplier_id')))
-    if current_mode == 'import':
-        if not rows:
-            await update.effective_message.reply_text(
-                'Не найдено пар «товар — цена». Проверь формат прайса или выбери «Авто».'
-            )
+    if current_mode == 'import' or (len(rows) >= 2 and context.user_data.get('supplier_id')):
+        sid = context.user_data.get('supplier_id')
+        if not sid or not get_supplier(sid):
+            await update.effective_message.reply_text('Сначала выбери поставщика через /suppliers.')
             return
-        context.user_data['pending'] = rows
-        await show_pending(update.effective_message, context)
-        return
-
-    # В авторежиме одиночное название без цены — поиск по всем поставщикам.
-    # Даже один товар с ценой может оказаться как прайсом, так и запросом;
-    # в этом случае не принимаем решение без пользователя.
-    if len(rows) >= 2:
-        context.user_data['pending'] = rows
-        await show_pending(update.effective_message, context)
+        try:
+            draft, _ = append_to_auto_draft(context, sid, text)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        await auto_draft_status(update.effective_message, draft)
     elif len(rows) == 1 or ('\n' in text and not rows):
         context.user_data['undecided_text'] = text
-        await update.effective_message.reply_text(
-            'Это поиск товара или загрузка прайса?', reply_markup=decision_keyboard()
-        )
+        await update.effective_message.reply_text('Это поиск товара или загрузка прайса?', reply_markup=decision_keyboard())
     else:
         await run_search(update.effective_message, text)
 
 
 
-
 async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
+        return
+    if context.user_data.get('auto_draft'):
+        await update.effective_message.reply_text('Сначала сохрани или отмени текстовый черновик.', reply_markup=auto_draft_keyboard(context.user_data['auto_draft']))
         return
     if context.user_data.get('parts'):
         await update.effective_message.reply_text('Сначала заверши или отмени сбор текстового прайса. Excel не будет импортирован во время сбора.', reply_markup=multipart_keyboard())
