@@ -5,6 +5,7 @@ import os
 import re
 import hashlib
 from io import BytesIO
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
 import time
 from datetime import timezone
@@ -20,6 +21,7 @@ from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
     get_excel_profiles, save_excel_profiles, export_supplier_offers,
+    get_usd_byn_rate, set_usd_byn_rate,
 )
 from product_parser import parse_product, section_brand, contextual_name
 from excel_importer import (inspect_xlsx, extract_xlsx, MAX_FILE_BYTES,
@@ -248,6 +250,7 @@ async def auto_draft_status(message, draft, context):
 
 def mode_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💱 Курс USD/BYN", callback_data="fx:menu")],
         [InlineKeyboardButton("🔄 Авто", callback_data="mode:auto"),
          InlineKeyboardButton("🔎 Поиск", callback_data="mode:search")],
         [InlineKeyboardButton("📥 Загрузка прайса", callback_data="mode:import")],
@@ -797,6 +800,19 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['mode'] = mode_name
         labels = {'auto': 'Авто', 'search': 'Поиск', 'import': 'Загрузка прайса'}
         await query.message.reply_text(f"✅ Режим: {labels[mode_name]}")
+    elif action == 'fx:menu':
+        rate = get_usd_byn_rate()
+        buttons = [[InlineKeyboardButton('✏️ Изменить курс USD/BYN', callback_data='fx:edit')]] if is_owner(update) else []
+        await query.message.reply_text(
+            f'💱 Курс сравнения: 1 USD = {rate} BYN\n'
+            'Курс используется для сортировки BYN и USD; цены поставщиков не изменяются.',
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+    elif action == 'fx:edit':
+        if not is_owner(update):
+            await query.message.reply_text('Изменять курс может только владелец.')
+            return
+        context.user_data['await_fx_rate'] = True
+        await query.message.reply_text('Введи новый курс: сколько BYN за 1 USD, например 3,05. /cancelrate — отмена.')
     elif action == 'nav:suppliers':
         await query.message.reply_text('Выбери поставщика:', reply_markup=keyboard_suppliers())
     elif action == 'nav:settings':
@@ -1006,6 +1022,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
     text = (update.effective_message.text or '').strip()
+    if context.user_data.get('await_fx_rate'):
+        if not is_owner(update):
+            context.user_data.pop('await_fx_rate', None)
+            return
+        if text.lower() in ('/cancelrate', 'отмена'):
+            context.user_data.pop('await_fx_rate', None)
+            await update.effective_message.reply_text('Изменение курса отменено.')
+            return
+        try:
+            value = Decimal(text.replace(',', '.').strip())
+            rate = set_usd_byn_rate(value)
+        except (InvalidOperation, ValueError):
+            await update.effective_message.reply_text('Некорректный курс. Введи число, например 3,05.')
+            return
+        context.user_data.pop('await_fx_rate', None)
+        await update.effective_message.reply_text(f'✅ Новый курс: 1 USD = {rate} BYN')
+        return
     rename_sid = context.user_data.get('await_rename_id')
     if rename_sid is not None:
         if not text or len(text) > 120 or '\n' in text:
@@ -1280,36 +1313,54 @@ async def run_search(message, query_text):
     if not matches:
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
         return
-    # Currency/VAT groups cannot be compared on the same price scale.
-    # Apply the per-supplier cap across all groups, then cap the full output.
+    rate = get_usd_byn_rate()
+    def comparable_price(offer):
+        try:
+            price = Decimal(str(offer['price']))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        currency = (offer.get('currency') or '').upper()
+        if currency == 'USD':
+            return price
+        if currency == 'BYN':
+            return price / rate
+        return None
+
+    # VAT is not silently normalized: different VAT statuses stay in separate groups.
+    # Unsupported currencies stay in separate groups and cannot be compared to USD.
     groups = {}
     for offer in matches:
-        groups.setdefault((offer['currency'], offer['tax_status']), []).append(offer)
-
+        key = (offer['tax_status'], 'USD-equivalent' if comparable_price(offer) is not None else (offer['currency'] or 'UNKNOWN'))
+        groups.setdefault(key, []).append(offer)
     selected = []
     supplier_counts = {}
-    for group_key, offers in sorted(groups.items()):
-        offers.sort(key=lambda o: (o['price'], o['supplier_name'].casefold()))
+    for group_key, offers in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+        offers.sort(key=lambda o: (comparable_price(o) if comparable_price(o) is not None else Decimal(str(o['price'] or 0)), o['supplier_name'].casefold()))
         for offer in offers:
-            supplier_key = offer['supplier_id']
-            if supplier_counts.get(supplier_key, 0) >= 3:
+            sid = offer['supplier_id']
+            if supplier_counts.get(sid, 0) >= 3:
                 continue
             selected.append((group_key, offer))
-            supplier_counts[supplier_key] = supplier_counts.get(supplier_key, 0) + 1
+            supplier_counts[sid] = supplier_counts.get(sid, 0) + 1
             if len(selected) >= 20:
                 break
         if len(selected) >= 20:
             break
 
-    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\nПоказано: {len(selected)} (не более 3 от поставщика)']
+    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\nПоказано: {len(selected)} (не более 3 от поставщика)\n💱 1 USD = {rate} BYN']
     previous_group = None
     for index, (group_key, offer) in enumerate(selected, 1):
         if group_key != previous_group:
-            currency, tax = group_key
-            blocks.append(f'\n📊 {currency}, ' + {'with_vat':'с НДС', 'without_vat':'без НДС',
-                          'unknown':'НДС не указан'}.get(tax,'НДС не указан'))
+            vat, comparison_currency = group_key
+            tax_text = {'with_vat': 'с НДС', 'without_vat': 'без НДС', 'unknown': 'НДС не указан'}.get(vat, 'НДС не указан')
+            blocks.append(f'\n📊 {comparison_currency}, {tax_text}')
             previous_group = group_key
-        blocks.append(format_offer(offer, index))
+        item_text = format_offer(offer, index)
+        converted = comparable_price(offer)
+        if converted is not None and offer.get('currency') == 'BYN':
+            usd = converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            item_text += f'\n≈ {usd} USD (по курсу {rate} BYN/USD)'
+        blocks.append(item_text)
     chunk = ''
     for block in blocks:
         if len(block) > 3700:
@@ -1320,6 +1371,11 @@ async def run_search(message, query_text):
         chunk += ('\n\n' if chunk else '') + block
     if chunk:
         await message.reply_text(chunk)
+
+
+async def cancelrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('await_fx_rate', None)
+    await update.effective_message.reply_text('Ввод курса отменён.')
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1335,6 +1391,7 @@ def main():
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
         app.add_handler(CommandHandler(command, handler))
+    app.add_handler(CommandHandler('cancelrate', cancelrate))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
