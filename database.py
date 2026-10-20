@@ -68,6 +68,13 @@ def init_db():
                 column_fingerprint JSONB NOT NULL,
                 PRIMARY KEY(supplier_id, sheet_name)
             )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )""")
+            cur.execute("""INSERT INTO app_settings (key, value)
+                VALUES ('usd_byn_rate', '3.01') ON CONFLICT (key) DO NOTHING""")
             cur.execute("ALTER TABLE offers ADD COLUMN IF NOT EXISTS ram_gb INTEGER")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_offers_model
@@ -402,3 +409,23 @@ def save_excel_profiles(supplier_id, profiles):
                     (supplier_id, item['sheet'], item['header_row'],
                      psycopg.types.json.Jsonb(item['mapping']),
                      psycopg.types.json.Jsonb(item['fingerprint'])))
+
+
+def get_usd_byn_rate():
+    """BYN per 1 USD; persisted across Railway restarts."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM app_settings WHERE key='usd_byn_rate'")
+            row = cur.fetchone()
+    return Decimal(row['value']) if row else Decimal('3.01')
+
+
+def set_usd_byn_rate(value):
+    rate = Decimal(str(value))
+    if not rate.is_finite() or rate <= 0 or rate > 1000:
+        raise ValueError('Курс должен быть положительным и не более 1000')
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO app_settings(key, value) VALUES ('usd_byn_rate', %s)
+                ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()""", (str(rate),))
+    return rate
