@@ -86,69 +86,102 @@ def multipart_start_keyboard():
 
 
 def parse_price_list(text, initial_brand=None, return_brand=False):
-    """Read Telegram supplier messages with headings, flags and price annotations.
+    """Parse supplier text using an explicit terminal price, preserving headings.
 
-    Keep a canonical name (e.g. 'iPhone 17 Pro') so search can distinguish
-    Apple devices from similarly named Xiaomi/Redmi products.
+    A bare final number is accepted only when the prefix looks like a product
+    and the price is not confused with an isolated model number or quantity.
     """
-    output, pending = [], None
+    output = []
+    pending = None
     active_brand = initial_brand
     number = r"(\d+(?:[.,]\d{1,2})?)"
     currency = r"(?:\$|USD|EUR|RUB|₽|€)?"
-    # The trailing eSIM note is product information, not part of the price.
-    trailing = r"(?:\s*\((?:e\s*sim|sim\s*\+\s*esim|dual\s*sim)\))?"
-    priced = re.compile(rf"^(.+?)\s*[-—–:]\s*[$€₽]?\s*{number}\s*{currency}{trailing}\s*$", re.I)
-    standalone = re.compile(rf"^[$€₽]?\s*{number}\s*{currency}{trailing}\s*$", re.I)
-    # Undelimited prices are common in pasted Telegram stock lists:
-    # "17 Pro 256GB (черный) eSIM  1320".
-    # Require TWO spaces between the item and its price so years, RAM, memory,
-    # model numbers and product codes aren't accidentally treated as prices.
-    # Accept a harmless decorative fire emoji after the price.
-    plain_final_price = re.compile(
-        rf"^(.+?)\s{{2,}}[$€₽]?\s*{number}\s*{currency}{trailing}\s*(?:🔥\s*)?$",
-        re.I,
-    )
-    for raw in html.unescape(text).splitlines():
-        line = raw.strip().strip('*_`\\ ').strip()
+    trailing_note = r"(?:\s*\((?:e\s*sim|sim\s*\+\s*esim|dual\s*sim)\))?"
+    # Miscellaneous availability notes follow the price in real supplier lists.
+    last_note = r"(?:\s*(?:🔥|бронь|завтра|в наличии|резерв|\((?:актив(?:,\s*запак)?|бронь|резерв)\)))*"
+    priced = re.compile(rf"^(.+?)\s*[-—–:]\s*[$€₽]?\s*{number}\s*{currency}{trailing_note}{last_note}\s*$", re.I)
+    standalone = re.compile(rf"^[$€₽]?\s*{number}\s*{currency}{trailing_note}{last_note}\s*$", re.I)
+    bare = re.compile(rf"^(.+?)\s+[$€₽]?\s*{number}\s*{currency}{trailing_note}{last_note}\s*$", re.I)
+    section_labels = re.compile(r"^(?:iphone|iphones|apple|samsung|redmi|xiaomi|macbook|ipad|apple watch|dyson)\s*[:：]?\s*[\W_]*$", re.I)
+    separators = re.compile(r"^[\W_]+$", re.UNICODE)
+
+    def is_product_name(name, price, explicit=False):
+        if not name or not any(ch.isalpha() for ch in name):
+            return False
+        if re.search(r"(?i)^(?:от\s+\d+\s*шт|доставка|оплата|заказ до|курс|скидка|отдаю с)\b", name):
+            return False
+        # A trailing generation number is not necessarily a price: "AirPods 4".
+        if not explicit and float(price.replace(',', '.')) < 10:
+            return False
+        if not explicit and len(name.split()) < 2 and not re.search(r'[\u0400-\u04ff]', name):
+            return False
+        return True
+
+    def clean_line(line):
+        # Markdown emphasis in copied supplier messages is not product data.
+        return html.unescape(line).replace('**', '').replace('`', '').replace('\u00a0', ' ').strip().strip('\\*_ ')
+
+    for raw in text.splitlines():
+        line = clean_line(raw)
         if not line:
             continue
         heading = section_brand(line)
         if heading:
-            active_brand = heading
+            active_brand, pending = heading, None
+            continue
+        if section_labels.fullmatch(line):
+            key = re.sub(r'[^a-z]', '', line.lower())
+            if key in ('iphone', 'iphones', 'apple'):
+                active_brand = 'Apple'
+            elif key in ('redmi', 'xiaomi', 'samsung'):
+                active_brand = key.capitalize()
             pending = None
             continue
-        # A model-only heading like '18 Pro/Pro Max 📱📱:' remains in Apple section.
-        if re.fullmatch(r'[0-9]{1,2}\s+Pro\s*/\s*Pro\s*Max\s*📱*\s*:', line, re.I):
+        # A product-specific subheading is not a SKU.
+        if re.match(r'^\d{1,2}\s+pro\s*/\s*pro\s*max\b', line, re.I):
             continue
-        # Remove Markdown fragments copied from formatted Telegram messages.
-        line = line.replace('**', '').replace('\u00a0', ' ').strip()
+        if separators.fullmatch(line) or line.startswith('@'):
+            pending = None
+            continue
+        # Avoid incorrectly choosing between prices for separate regions.
+        # Example: "🇭🇰/🇪🇺 1250/1270" needs a separate future workflow.
+        if re.search(r"\b\d{2,6}\s*/\s*\d{2,6}\s*(?:🔥|бронь)?\s*$", line):
+            pending = None
+            continue
         match = priced.fullmatch(line)
+        explicit = bool(match)
+        if not match:
+            match = bare.fullmatch(line)
         if match:
             name = _clean_price_name(match.group(1))
-            # Parenthesized eSIM info is crucial to search and display.
-            suffix = re.search(r'\(e\s*sim\)', line, re.I)
-            if suffix and not re.search(r'\besim\b', name, re.I):
-                name += ' eSIM'
-            if name:
-                output.append((contextual_name(name, active_brand), match.group(2)))
-            pending = None
-            continue
-        match = plain_final_price.fullmatch(line)
-        if match:
-            name = _clean_price_name(match.group(1))
-            if name:
-                output.append((contextual_name(name, active_brand), match.group(2)))
+            price = match.group(2)
+            if is_product_name(name, price, explicit):
+                # Preserve eSIM when the supplier puts the note after the price.
+                if re.search(r'\(e\s*sim\)', line, re.I) and not re.search(r'\besim\b', name, re.I):
+                    name += ' eSIM'
+                if re.search(r'\(актив(?:,\s*запак)?\)', line, re.I):
+                    name += ' Активирован'
+                # Unlabelled iPhone generations are frequent after non-iPhone
+                # categories. Only infer Apple from strongly iPhone-shaped rows;
+                # explicit Samsung/Redmi/Xiaomi context takes precedence.
+                brand = active_brand
+                if brand not in ('Samsung', 'Redmi', 'Xiaomi') and re.match(
+                    r'^\d{2}(?:e|\s+(?:pro(?:\s+max)?|plus))?\s+'
+                    r'(?:64|128|256|512|1\s*tb|2\s*tb)\b', name, re.I
+                ):
+                    brand = 'Apple'
+                output.append((contextual_name(name, brand), price))
             pending = None
             continue
         match = standalone.fullmatch(line)
         if match and pending:
-            output.append((contextual_name(_clean_price_name(pending), active_brand), match.group(1)))
+            name = _clean_price_name(pending)
+            if is_product_name(name, match.group(1), True):
+                output.append((contextual_name(name, active_brand), match.group(1)))
             pending = None
             continue
-        # Avoid treating category labels as product names.
-        if re.fullmatch(r'[—–\-_=📱⌚💻\s]+', line):
-            continue
-        pending = line
+        # Do not take bare prices from paragraphs such as "+1%".
+        pending = line if len(line) < 250 and not re.search(r'\bпо запросу\b', line, re.I) else None
     return (output, active_brand) if return_brand else output
 
 
