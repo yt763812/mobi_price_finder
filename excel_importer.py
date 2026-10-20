@@ -6,7 +6,7 @@ from collections import Counter
 from openpyxl import load_workbook
 from product_parser import parse_product, section_brand, contextual_name
 
-NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название товара', 'товар', 'product', 'model', 'item', 'description')
+NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название', 'название товара', 'товар', 'product', 'model', 'item', 'description')
 PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная')
 BRAND_HEADERS = ('бренд', 'брэнд', 'brand', 'производитель')
 COLOR_HEADERS = ('цвет', 'color', 'colour')
@@ -14,7 +14,7 @@ REGION_HEADERS = ('происхождение', 'регион', 'страна', 
 CATEGORY_HEADERS = ('категория', 'category')
 BAD_PRICE = ('итого', 'total', 'сумма', 'розница', 'retail', 'ррц')
 MAX_FILE_BYTES = 12 * 1024 * 1024
-MAX_ROWS = 30000
+MAX_ROWS = 60000
 
 
 def _clean(value):
@@ -267,7 +267,7 @@ def extract_xlsx(data, sheet_name, mapping, header_row, default_brand=None):
     try:
         ws = wb[sheet_name]
         if ws.max_row and ws.max_row > MAX_ROWS:
-            raise ValueError('Превышен лимит 30000 строк')
+            raise ValueError(f'Превышен лимит {MAX_ROWS} строк')
         _, price_probe = _column_price_quality(ws, mapping, header_row)
         if _price_column_is_suspicious(price_probe) or _price_header_is_identifier(ws, mapping, header_row):
             raise ValueError('Столбец цены содержит почти одинаковые значения (возможно, дату прайса). Выбери правильный столбец.')
