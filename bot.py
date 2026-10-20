@@ -1326,38 +1326,39 @@ async def run_search(message, query_text):
             return price / rate
         return None
 
-    # VAT is not silently normalized: different VAT statuses stay in separate groups.
-    # Unsupported currencies stay in separate groups and cannot be compared to USD.
-    groups = {}
-    for offer in matches:
-        key = (offer['tax_status'], 'USD-equivalent' if comparable_price(offer) is not None else (offer['currency'] or 'UNKNOWN'))
-        groups.setdefault(key, []).append(offer)
+    # Sort ALL USD/BYN offers by their comparable USD price, regardless of
+    # currency. VAT is displayed on every item; it is NOT silently normalized.
+    # Unknown currencies sort after comparable ones.
+    def sort_key(offer):
+        price = comparable_price(offer)
+        if price is None:
+            try:
+                native_price = Decimal(str(offer['price']))
+            except (InvalidOperation, ValueError, TypeError):
+                native_price = Decimal('Infinity')
+            return (1, str(offer.get('currency') or ''), native_price,
+                    offer['supplier_name'].casefold())
+        return (0, '', price, offer['supplier_name'].casefold())
+
     selected = []
     supplier_counts = {}
-    for group_key, offers in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
-        offers.sort(key=lambda o: (comparable_price(o) if comparable_price(o) is not None else Decimal(str(o['price'] or 0)), o['supplier_name'].casefold()))
-        for offer in offers:
-            sid = offer['supplier_id']
-            if supplier_counts.get(sid, 0) >= 3:
-                continue
-            selected.append((group_key, offer))
-            supplier_counts[sid] = supplier_counts.get(sid, 0) + 1
-            if len(selected) >= 20:
-                break
+    for offer in sorted(matches, key=sort_key):
+        sid = offer['supplier_id']
+        if supplier_counts.get(sid, 0) >= 3:
+            continue
+        selected.append(offer)
+        supplier_counts[sid] = supplier_counts.get(sid, 0) + 1
         if len(selected) >= 20:
             break
 
-    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\nПоказано: {len(selected)} (не более 3 от поставщика)\n💱 1 USD = {rate} BYN']
-    previous_group = None
-    for index, (group_key, offer) in enumerate(selected, 1):
-        if group_key != previous_group:
-            vat, comparison_currency = group_key
-            tax_text = {'with_vat': 'с НДС', 'without_vat': 'без НДС', 'unknown': 'НДС не указан'}.get(vat, 'НДС не указан')
-            blocks.append(f'\n📊 {comparison_currency}, {tax_text}')
-            previous_group = group_key
+    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\n'
+              f'Показано: {len(selected)} (не более 3 от поставщика)\n'
+              f'💱 1 USD = {rate} BYN\n'
+              'Сортировка по эквиваленту USD; цены с НДС и без НДС не приведены к одной налоговой базе.']
+    for index, offer in enumerate(selected, 1):
         item_text = format_offer(offer, index)
         converted = comparable_price(offer)
-        if converted is not None and offer.get('currency') == 'BYN':
+        if converted is not None and (offer.get('currency') or '').upper() == 'BYN':
             usd = converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             item_text += f'\n≈ {usd} USD (по курсу {rate} BYN/USD)'
         blocks.append(item_text)
