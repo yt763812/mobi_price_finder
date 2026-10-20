@@ -1145,7 +1145,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             item.update(mapping=oldmap, header_row=oldhead, enabled=True)
             # Reuse supplier's validated column choice if headers are unchanged.
             old = profiles.get(name)
-            if old:
+            if old and not (result['status'] == 'preview' and result.get('valid', 0) > 0):
                 oldmap, oldhead = old['mapping'], old['header_row']
                 if sheet_fingerprint(payload, name, oldhead, oldmap) == old['column_fingerprint']:
                     check = inspect_mapping(payload, name, oldmap, oldhead)
