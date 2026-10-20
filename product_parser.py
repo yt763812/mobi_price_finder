@@ -83,16 +83,19 @@ def detect_storage(text):
 
 def detect_iphone(text):
     t = normalize(text)
+    # iPhone Air is a distinct model family, not a generic two-word search.
+    if re.search(r"(?<!\w)(?:iphone|айфон)\s+air(?!\w)", t):
+        return "iPhone Air"
     m = re.search(
         r"(?:iphone|айфон|айфона)\s*(\d{1,2})"
-        r"(?:\s*(pro\s*max|про\s*макс|promax|про|pro|plus|плюс))?",
+        r"(?:\s*(pro\s*max|про\s*макс|promax|про|pro|plus|плюс|air))?",
         t,
     )
     if not m:
         return None
     suffix = (m.group(2) or "").replace(" ", "")
     labels = {"promax": "Pro Max", "промакс": "Pro Max",
-              "pro": "Pro", "про": "Pro", "plus": "Plus", "плюс": "Plus"}
+              "pro": "Pro", "про": "Pro", "plus": "Plus", "плюс": "Plus", "air": "Air"}
     return f"iPhone {m.group(1)}" + (f" {labels[suffix]}" if suffix in labels else "")
 
 
@@ -125,8 +128,8 @@ def detect_sim(text):
 # Product-role identification: compatibility mentions must not turn a case into a phone.
 # Only explicit accessory nouns are used; unknown products remain searchable.
 ACCESSORY_PATTERNS = [
-    r"(?<!\w)(?:case|cases|cover|covers|чехол|чехлы|накладка|бампер)(?!\w)",
-    r"(?<!\w)(?:screen\s*protector|glass\s*protector|tempered\s*glass|защитное\s*стекло|пленка|плёнка)(?!\w)",
+    r"(?<!\w)(?:case|cases|cover|covers|чехол|чехлы|чехла|накладка|бампер|bumper)(?!\w)",
+    r"(?<!\w)(?:screen\s*protector|glass\s*protector|tempered\s*glass|защитн\w*\s*стекл\w*|стекло|glass|пленка|плёнка)(?!\w)",
     r"(?<!\w)(?:charger|charging\s*adapter|power\s*adapter|зарядное\s*устройство|зарядка|адаптер\s*питания)(?!\w)",
     r"(?<!\w)(?:phone\s*holder|держатель\s*для\s*телефона|кабель|cable)(?!\w)",
 ]
@@ -236,17 +239,12 @@ def detect_sku(text):
 
 
 # Brand/category headings are whole lines without prices; never guess from arbitrary prose.
-SECTION_BRANDS = {'apple': 'Apple', 'iphone': 'Apple', 'iphones': 'Apple', 'айфоны': 'Apple', 'samsung': 'Samsung',
+SECTION_BRANDS = {'apple': 'Apple', 'iphone': 'Apple', 'samsung': 'Samsung',
                   'xiaomi': 'Xiaomi', 'redmi': 'Redmi', 'poco': 'POCO'}
 
 
 def section_brand(text):
-    # Section headings may contain emoji, a colon and Telegram's pasted Markdown.
-    cleaned = str(text).casefold().replace('ё', 'е')
-    cleaned = re.sub(r'[\uFE0E\uFE0F\u200D]', '', cleaned)
-    cleaned = re.sub(r'^[\s*_*`]+|[\s*_*`]+$', '', cleaned)
-    cleaned = re.sub(r'[📱⌚💻📦:：\s*_*`—–-]+$', '', cleaned).strip()
-    cleaned = re.sub(r'^[📱⌚💻📦\s*_*`]+', '', cleaned).strip()
+    cleaned = re.sub(r"[\s:—–\-]+$", "", str(text).strip()).casefold()
     return SECTION_BRANDS.get(cleaned)
 
 
