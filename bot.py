@@ -11,6 +11,7 @@ from datetime import timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
@@ -216,14 +217,33 @@ def append_to_auto_draft(context, supplier_id, incoming):
     return draft, True
 
 
-async def auto_draft_status(message, draft):
-    await message.reply_text(
+async def auto_draft_status(message, draft, context):
+    """Keep one live Telegram preview instead of one message per pasted part."""
+    body = (
         f"📥 Черновик прайса: {len(draft['messages'])} сообщ.\n"
         f"Распознано строк с ценой: {len(draft['rows'])}.\n"
         "Можешь отправить следующие сообщения. Когда всё пришло, нажми «Сохранить общий прайс». "
-        "До нажатия данные в базе не изменятся.",
-        reply_markup=auto_draft_keyboard(draft),
+        "До нажатия данные в базе не изменятся."
     )
+    status_chat_id = draft.get('status_chat_id')
+    status_message_id = draft.get('status_message_id')
+    if status_chat_id and status_message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=status_chat_id, message_id=status_message_id,
+                text=body, reply_markup=auto_draft_keyboard(draft),
+            )
+            return
+        except BadRequest as exc:
+            # A deleted/inaccessible old preview is recoverable: create a new one.
+            if 'message is not modified' in str(exc).lower():
+                return
+            logger.warning('Cannot edit draft preview, sending new one: %s', exc)
+        except TelegramError as exc:
+            logger.warning('Cannot edit draft preview, sending new one: %s', exc)
+    sent = await message.reply_text(body, reply_markup=auto_draft_keyboard(draft))
+    draft['status_chat_id'] = sent.chat_id
+    draft['status_message_id'] = sent.message_id
 
 
 def mode_keyboard():
@@ -701,6 +721,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if op == 'cancel':
             context.user_data.pop('auto_draft', None)
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=draft.get('status_chat_id'), message_id=draft.get('status_message_id'),
+                    reply_markup=None,
+                )
+            except TelegramError:
+                pass
             await query.message.reply_text('❌ Черновик отменён. Сохранённый прайс не изменён.')
         elif op == 'save':
             sid = context.user_data.get('supplier_id')
@@ -718,6 +745,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text('❌ Ошибка сохранения. Старый прайс должен остаться без изменений. Проверь Railway Logs.')
                 return
             context.user_data.pop('auto_draft', None)
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=draft.get('status_chat_id'), message_id=draft.get('status_message_id'),
+                    reply_markup=None,
+                )
+            except TelegramError:
+                pass
             await query.message.reply_text(
                 f"✅ Общий прайс сохранён!\nСообщений: {len(draft['messages'])}\n"
                 f"Конфигураций: {summary['saved']}\nДубли: {summary['duplicates']}\n"
@@ -796,7 +830,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except ValueError as exc:
                     await query.message.reply_text(str(exc))
                     return
-                await auto_draft_status(query.message, draft)
+                await auto_draft_status(query.message, draft, context)
     elif action == 'supplier:new':
         context.user_data.pop('await_rename_id', None)
         context.user_data['await_name'] = True
@@ -1014,7 +1048,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(str(exc), reply_markup=auto_draft_keyboard(existing_draft))
             return
         if added:
-            await auto_draft_status(update.effective_message, draft)
+            await auto_draft_status(update.effective_message, draft, context)
         else:
             await update.effective_message.reply_text('Такое сообщение уже есть в черновике.', reply_markup=auto_draft_keyboard(draft))
         return
@@ -1054,7 +1088,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return
-        await auto_draft_status(update.effective_message, draft)
+        await auto_draft_status(update.effective_message, draft, context)
     elif len(rows) == 1 or ('\n' in text and not rows):
         context.user_data['undecided_text'] = text
         await update.effective_message.reply_text('Это поиск товара или загрузка прайса?', reply_markup=decision_keyboard())
