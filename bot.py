@@ -1354,7 +1354,7 @@ async def run_search(message, query_text):
     blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\n'
               f'Показано: {len(selected)} (не более 3 от поставщика)\n'
               f'💱 1 USD = {rate} BYN\n'
-              'Сортировка по эквиваленту USD; цены с НДС и без НДС не приведены к одной налоговой базе.']
+              'Данные результаты результат работы альфа версии']
     for index, offer in enumerate(selected, 1):
         item_text = format_offer(offer, index)
         converted = comparable_price(offer)
