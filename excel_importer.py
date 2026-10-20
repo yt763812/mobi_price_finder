@@ -7,7 +7,7 @@ from openpyxl import load_workbook
 from product_parser import parse_product, section_brand, contextual_name
 
 NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название товара', 'товар', 'product', 'model', 'item', 'description')
-PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб')
+PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная')
 BRAND_HEADERS = ('бренд', 'брэнд', 'brand', 'производитель')
 COLOR_HEADERS = ('цвет', 'color', 'colour')
 REGION_HEADERS = ('происхождение', 'регион', 'страна', 'region')
@@ -26,12 +26,28 @@ def _header(value):
 
 
 def _preferred_price(row):
-    # Explicit USD and generic price columns take priority over RUB totals.
+    """Prefer explicit purchase prices; VAT inclusive where the file offers it."""
     indices = _indices(row, PRICE_HEADERS)
-    return sorted(indices, key=lambda i: (
-        0 if ('usd' in _header(row[i]) or '$' in _header(row[i])) else
-        2 if ('rub' in _header(row[i]) or 'руб' in _header(row[i])) else 1, i))
+    def rank(i):
+        value = _header(row[i])
+        if value == 'цена с ндс': return (0, i)
+        if value == 'цена без ндс': return (1, i)
+        if 'usd' in value or '$' in value: return (2, i)
+        if value == 'цена розничная': return (5, i)
+        return (3, i)
+    return sorted(indices, key=rank)
 
+
+def _price_header_is_identifier(ws, mapping, header_row):
+    """Never interpret EAN/SKU/tariff-code columns as money, even if saved in a profile."""
+    idx = mapping.get('price')
+    if idx is None: return True
+    if header_row:
+        header = next(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True), ())
+        label = _header(header[idx] if idx < len(header) else None)
+        if any(x in label for x in ('ean', 'штрихкод', 'артикул', 'код тнвэд', 'номенклатура.код', 'barcode', 'sku')):
+            return True
+    return False
 
 
 def _indices(row, aliases):
@@ -47,7 +63,7 @@ def _price(value):
         return None
     try:
         result = Decimal(raw)
-        if not result.is_finite() or result <= 0:
+        if not result.is_finite() or result <= 0 or result >= Decimal('1000000000'):
             return None
         return result.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     except (InvalidOperation, ValueError):
@@ -148,7 +164,7 @@ def inspect_xlsx(data):
                 sheets.append({'sheet': ws.title, 'status': 'unknown'})
                 continue
             _, price_probe = _column_price_quality(ws, mapping, header_row)
-            if _price_column_is_suspicious(price_probe):
+            if _price_column_is_suspicious(price_probe) or _price_header_is_identifier(ws, mapping, header_row):
                 sheets.append({'sheet': ws.title, 'status': 'unknown'})
                 continue
             count = valid = no_price = 0
@@ -208,7 +224,7 @@ def extract_xlsx(data, sheet_name, mapping, header_row, default_brand=None):
         if ws.max_row and ws.max_row > MAX_ROWS:
             raise ValueError('Превышен лимит 30000 строк')
         _, price_probe = _column_price_quality(ws, mapping, header_row)
-        if _price_column_is_suspicious(price_probe):
+        if _price_column_is_suspicious(price_probe) or _price_header_is_identifier(ws, mapping, header_row):
             raise ValueError('Столбец цены содержит почти одинаковые значения (возможно, дату прайса). Выбери правильный столбец.')
         rows = []
         skipped = 0
@@ -273,7 +289,7 @@ def inspect_mapping(data, sheet_name, mapping, header_row):
         if mapping.get('name') is None or mapping.get('price') is None or mapping['name'] == mapping['price']:
             return {'valid': 0, 'named': 0, 'no_price': 0, 'samples': [], 'truncated': False}
         _, price_probe = _column_price_quality(ws, mapping, header_row)
-        if _price_column_is_suspicious(price_probe):
+        if _price_column_is_suspicious(price_probe) or _price_header_is_identifier(ws, mapping, header_row):
             return {'valid': 0, 'named': 0, 'no_price': 0, 'samples': [], 'truncated': False, 'warning': 'Подозрительный столбец цены: одинаковые значения, возможно дата'}
         valid = named = no_price = 0
         samples = []
