@@ -128,15 +128,60 @@ def _positional_mapping(ws):
             'category': None, 'color': None, 'region': None}
 
 
-def inspect_xlsx(data):
+
+def _multirow_price_mapping(ws, tax_status='with_vat'):
+    """Read two-tier headers: Цена -> Без НДС / С НДС / РРЦ.
+
+    Treat the second header row as the final header. Never select EAN/RRP.
+    """
+    top = list(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 30), values_only=True))
+    for i in range(len(top) - 1):
+        row, sub = top[i], top[i + 1]
+        names = _indices(row, NAME_HEADERS)
+        if not names:
+            continue
+        base = [j for j, cell in enumerate(row) if _header(cell) == 'цена']
+        if not base:
+            continue
+        starts = base[0]
+        candidates = []
+        for j in range(starts, min(len(sub), starts + 5)):
+            h = _header(sub[j])
+            if h in ('без ндс', 'с ндс'):
+                candidates.append((j, h))
+        if not candidates:
+            continue
+        preferred = ('с ндс' if tax_status == 'with_vat' else 'без ндс')
+        selected = next((j for j, h in candidates if h == preferred), None)
+        if selected is None:
+            # Tax status is explicit: do not silently import the opposite VAT price.
+            return {'status': 'tax_column_missing', 'sheet': ws.title}
+        brands = _indices(row, BRAND_HEADERS)
+        colors = _indices(row, COLOR_HEADERS)
+        regions = _indices(row, REGION_HEADERS)
+        categories = _indices(row, CATEGORY_HEADERS)
+        return {'status': 'ok', 'mapping': {'name': names[0], 'price': selected,
+                'brand': brands[0] if brands else None,
+                'category': categories[0] if categories else None,
+                'color': colors[0] if colors else None,
+                'region': regions[0] if regions else None},
+                'header_row': i + 2, 'price_header': f'Цена — {preferred}'}
+    return None
+
+def inspect_xlsx(data, tax_status='with_vat'):
     if len(data) > MAX_FILE_BYTES:
         raise ValueError('Файл больше 12 МБ. Пришли файл поменьше.')
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         sheets = []
         for ws in wb.worksheets:
-            header_row = None
-            mapping = None
+            multi = _multirow_price_mapping(ws, tax_status)
+            if multi and multi['status'] != 'ok':
+                sheets.append({'sheet': ws.title, 'status': 'unknown'})
+                continue
+            header_row = multi['header_row'] if multi else None
+            mapping = multi['mapping'] if multi else None
+            price_header = multi['price_header'] if multi else None
             ambiguous = False
             for row_num, row in enumerate(ws.iter_rows(min_row=1, max_row=25, values_only=True), 1):
                 names = _indices(row, NAME_HEADERS)
@@ -145,7 +190,7 @@ def inspect_xlsx(data):
                 categories = _indices(row, CATEGORY_HEADERS)
                 colors = _indices(row, COLOR_HEADERS)
                 regions = _indices(row, REGION_HEADERS)
-                if names and prices:
+                if mapping is None and names and prices:
                     header_row = row_num
                     mapping = {'name': names[0], 'price': prices[0],
                                'brand': brands[0] if brands else None,
