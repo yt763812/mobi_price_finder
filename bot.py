@@ -1157,7 +1157,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await doc.get_file()
         payload = bytes(await tg_file.download_as_bytearray())
-        detected = inspect_xlsx(payload)
+        detected = inspect_xlsx(payload, tax_status=supplier['tax_status'])
         profiles = get_excel_profiles(sid)
         sheets = []
         for result in detected:
