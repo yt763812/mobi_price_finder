@@ -37,6 +37,7 @@ def init_db():
             cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'UNKNOWN'")
             cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS tax_status TEXT NOT NULL DEFAULT 'unknown'")
             cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS last_price_import_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS delivery_workdays INTEGER CHECK (delivery_workdays >= 0)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS offers (
                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -246,14 +247,14 @@ def list_suppliers():
     """Show registered suppliers without exposing database credentials."""
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, validity_hours, currency, tax_status, last_price_import_at FROM suppliers ORDER BY name")
+            cur.execute("SELECT id, name, validity_hours, currency, tax_status, last_price_import_at, delivery_workdays FROM suppliers ORDER BY name")
             return cur.fetchall()
 
 
 def get_supplier(supplier_id):
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, validity_hours, currency, tax_status, last_price_import_at FROM suppliers WHERE id=%s", (supplier_id,))
+            cur.execute("SELECT id, name, validity_hours, currency, tax_status, last_price_import_at, delivery_workdays FROM suppliers WHERE id=%s", (supplier_id,))
             return cur.fetchone()
 
 
@@ -299,6 +300,18 @@ def update_supplier_settings(supplier_id, currency=None, tax_status=None):
                 cur.execute('UPDATE suppliers SET currency=%s WHERE id=%s', (currency, supplier_id))
             if tax_status is not None:
                 cur.execute('UPDATE suppliers SET tax_status=%s WHERE id=%s', (tax_status, supplier_id))
+    return get_supplier(supplier_id)
+
+
+def set_supplier_delivery_days(supplier_id, days):
+    """Set delivery lead time; None means unknown."""
+    if days is not None and (not isinstance(days, int) or days < 0 or days > 365):
+        raise ValueError('Срок доставки должен быть от 0 до 365 рабочих дней.')
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('UPDATE suppliers SET delivery_workdays=%s WHERE id=%s', (days, supplier_id))
+            if cur.rowcount != 1:
+                raise ValueError('Поставщик не найден.')
     return get_supplier(supplier_id)
 
 
@@ -381,7 +394,7 @@ def search_offers():
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT o.*, s.name AS supplier_name,
+                SELECT o.*, s.name AS supplier_name, s.delivery_workdays,
                     (o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour') AS is_fresh
                 FROM offers o JOIN suppliers s ON s.id=o.supplier_id
                 ORDER BY s.name, o.original_name
