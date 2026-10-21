@@ -92,6 +92,8 @@ def detect_iphone(text):
         t,
     )
     if not m:
+        if re.search(r"(?<!\w)(?:iphone|айфон)\s*air(?!\w)", t):
+            return "iPhone Air"
         return None
     suffix = (m.group(2) or "").replace(" ", "")
     labels = {"promax": "Pro Max", "промакс": "Pro Max",
@@ -135,9 +137,45 @@ ACCESSORY_PATTERNS = [
 ]
 
 
-def is_accessory(text):
+# Compatibility references must not turn a component into a complete device.
+COMPONENT_PATTERNS = [
+    r"(?<!\w)(?:левое\s*ухо|правое\s*ухо|левый\s*наушник|правый\s*наушник|left\s*earbud|right\s*earbud|left\s*earpiece|right\s*earpiece)(?!\w)",
+    r"(?<!\w)(?:зарядный\s*кейс|зарядный\s*футляр|charging\s*case|replacement\s*case)(?!\w)",
+]
+EXTRA_ACCESSORY_PATTERNS = [
+    r"(?<!\w)(?:magsafe\s*battery|battery\s*pack|внешний\s*аккумулятор|пауэрбанк|power\s*bank)(?!\w)",
+    r"(?<!\w)(?:защитное\s*стекло|glass\s*film|ремешок\s*для|strap\s*for|strap\s*для)(?!\w)",
+]
+
+
+def product_role(text):
     t = normalize(text)
-    return any(re.search(pattern, t) for pattern in ACCESSORY_PATTERNS)
+    if any(re.search(p, t) for p in COMPONENT_PATTERNS):
+        return 'component'
+    if any(re.search(p, t) for p in ACCESSORY_PATTERNS + EXTRA_ACCESSORY_PATTERNS):
+        return 'accessory'
+    return 'device'
+
+
+def is_accessory(text):
+    return product_role(text) != 'device'
+
+
+def detect_audio_watch_model(text):
+    t = normalize(text)
+    m = re.search(r'(?<!\w)air\s*pods\s*(pro|max|[1-9])(?:\s*([1-9]))?(?!\w)', t)
+    if m:
+        family = m.group(1)
+        if family.isdigit():
+            return 'AirPods', int(family)
+        return 'AirPods ' + family.title(), int(m.group(2)) if m.group(2) else None
+    m = re.search(r'(?<!\w)(?:apple\s*)?watch\s*(ultra|se|series|s)(?:\s*([0-9]{1,2}))?(?!\w)', t)
+    if m:
+        family = m.group(1)
+        if family in ('series', 's'):
+            return 'Apple Watch Series', int(m.group(2)) if m.group(2) else None
+        return 'Apple Watch ' + family.upper().replace('ULTRA','Ultra'), int(m.group(2)) if m.group(2) else None
+    return None, None
 
 
 def detect_condition(text):
@@ -286,6 +324,9 @@ def country_from_flag(flag):
 
 def parse_product(text):
     model = detect_iphone(text)
+    audio_family, audio_generation = detect_audio_watch_model(text)
+    if not model and audio_family:
+        model = audio_family + (f" {audio_generation}" if audio_generation is not None else "")
     other_brand, other_model = detect_other_model(text) if not model else (None, None)
     if not model:
         model = other_model
@@ -329,5 +370,8 @@ def parse_product(text):
         "condition": detect_condition(text),
         "sku": detect_sku(text),
         "is_accessory": is_accessory(text),
+        "product_role": product_role(text),
+        "family": audio_family,
+        "generation": audio_generation,
         "warnings": warnings,
     }
