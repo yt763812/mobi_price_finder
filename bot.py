@@ -6,7 +6,7 @@ import re
 import hashlib
 from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from datetime import timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -21,7 +21,7 @@ from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
     get_excel_profiles, save_excel_profiles, export_supplier_offers,
-    get_usd_byn_rate, set_usd_byn_rate,
+    get_usd_byn_rate, set_usd_byn_rate, set_supplier_delivery_days,
 )
 from product_parser import parse_product, section_brand, contextual_name
 from excel_importer import (inspect_xlsx, extract_xlsx, MAX_FILE_BYTES,
@@ -297,9 +297,34 @@ def _price_import_time(value, short=False):
         return 'нет данных'
 
 
+def _delivery_label(days):
+    if days is None:
+        return 'Не указан'
+    if days == 0:
+        return 'Сегодня (0 рабочих дней)'
+    return f'{days} раб. дн.'
+
+
+def _delivery_date(days):
+    if days is None:
+        return None
+    try:
+        tz = ZoneInfo(os.getenv('PRICE_TIMEZONE', 'Europe/Moscow'))
+    except ZoneInfoNotFoundError:
+        tz = timezone.utc
+    day = datetime.now(tz).date()
+    count = 0
+    while count < days:
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            count += 1
+    return day.strftime('%d.%m.%Y')
+
+
 def _supplier_title(supplier):
     return (f"{supplier['name']}\n"
-            f"🕒 Последний прайс: {_price_import_time(supplier.get('last_price_import_at'))}")
+            f"🕒 Последний прайс: {_price_import_time(supplier.get('last_price_import_at'))}\n"
+            f"🚚 Доставка: {_delivery_label(supplier.get('delivery_workdays'))}")
 
 
 def keyboard_suppliers():
@@ -318,7 +343,7 @@ def supplier_manage_keyboard(supplier, can_delete=True):
         buttons.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"supplier:delete:{sid}")])
     buttons += [
         [InlineKeyboardButton("📥 Выгрузить прайс (Excel)", callback_data=f"supplier:export:{sid}")],
-        [InlineKeyboardButton("⚙️ Валюта и НДС", callback_data=f"supplier:settings:{sid}")],
+        [InlineKeyboardButton("⚙️ Валюта, НДС и доставка", callback_data=f"supplier:settings:{sid}")],
         [InlineKeyboardButton("👥 Все поставщики", callback_data="nav:suppliers")],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -336,6 +361,7 @@ def settings_keyboard(supplier):
     buttons = [
         [InlineKeyboardButton(f"Валюта: {supplier['currency']}", callback_data=f"settings:currency:{sid}")],
         [InlineKeyboardButton(f"НДС: {supplier['tax_status']}", callback_data=f"settings:vat:{sid}")],
+        [InlineKeyboardButton(f"🚚 Доставка: {_delivery_label(supplier.get('delivery_workdays'))}", callback_data=f"settings:delivery:{sid}")],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -389,7 +415,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Сначала выбери поставщика через /suppliers")
         return
     await update.effective_message.reply_text(
-        f"⚙️ {s['name']}\nВалюта: {s['currency']}\nНДС: {s['tax_status']}",
+        f"⚙️ {s['name']}\nВалюта: {s['currency']}\nНДС: {s['tax_status']}\nДоставка: {_delivery_label(s.get('delivery_workdays'))}",
         reply_markup=settings_keyboard(s),
     )
 
@@ -716,6 +742,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     action = query.data or ''
+    if action.startswith('sr:'):
+        await search_results_callback(query, context, action)
+        return
     if action.startswith('draft:'):
         op, revision_raw = action.split(':')[1:]
         draft = context.user_data.get('auto_draft')
@@ -831,7 +860,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         decision = action.split(':', 1)[1]
         if decision == 'search':
-            await run_search(query.message, raw)
+            await run_search(query.message, raw, context)
         elif decision == 'import':
             rows = parse_price_list(raw, _supplier_default_brand(context.user_data.get('supplier_id')))
             if not rows:
@@ -935,6 +964,17 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif operation == 'settings':
             context.user_data['supplier_id'] = sid
             await query.message.reply_text(f"⚙️ {s['name']}", reply_markup=settings_keyboard(s))
+    elif action.startswith('settings:delivery:'):
+        sid = int(action.rsplit(':', 1)[1])
+        supplier = get_supplier(sid)
+        if not supplier:
+            await query.message.reply_text('Поставщик не найден.')
+            return
+        context.user_data['await_delivery_id'] = sid
+        await query.message.reply_text(
+            f"🚚 {supplier['name']}\nТекущий срок: {_delivery_label(supplier.get('delivery_workdays'))}\n"
+            'Отправь количество РАБОЧИХ дней (0 — сегодня).\n'
+            '«нет» — неизвестный срок, «отмена» — не менять.')
     elif action.startswith('settings:currency:'):
         sid = int(action.rsplit(':', 1)[1])
         buttons = [[InlineKeyboardButton(c, callback_data=f"setcur:{sid}:{c}")]
@@ -1022,6 +1062,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
     text = (update.effective_message.text or '').strip()
+    delivery_sid = context.user_data.get('await_delivery_id')
+    if delivery_sid is not None:
+        if text.casefold() in ('отмена', '/cancel', '/cancelrate'):
+            context.user_data.pop('await_delivery_id', None)
+            await update.effective_message.reply_text('Настройка срока доставки отменена.')
+            return
+        try:
+            if text.casefold() in ('нет', 'не указан', '-'):
+                days = None
+            elif re.fullmatch(r'\d{1,3}', text) and int(text) <= 365:
+                days = int(text)
+            else:
+                raise ValueError()
+            supplier = set_supplier_delivery_days(delivery_sid, days)
+        except ValueError:
+            await update.effective_message.reply_text('Введи число от 0 до 365 или «нет» для неизвестного срока.')
+            return
+        context.user_data.pop('await_delivery_id', None)
+        await update.effective_message.reply_text(
+            f"✅ {supplier['name']}: 🚚 {_delivery_label(days)}", reply_markup=settings_keyboard(supplier))
+        return
     if context.user_data.get('await_fx_rate'):
         if not is_owner(update):
             context.user_data.pop('await_fx_rate', None)
@@ -1107,7 +1168,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     current_mode = context.user_data.get('mode', 'auto')
     if current_mode == 'search':
-        await run_search(update.effective_message, text)
+        await run_search(update.effective_message, text, context)
         return
 
     rows = parse_price_list(text, _supplier_default_brand(context.user_data.get('supplier_id')))
@@ -1126,7 +1187,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['undecided_text'] = text
         await update.effective_message.reply_text('Это поиск товара или загрузка прайса?', reply_markup=decision_keyboard())
     else:
-        await run_search(update.effective_message, text)
+        await run_search(update.effective_message, text, context)
 
 
 
@@ -1210,7 +1271,7 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'Просто напиши название товара, например: айфон 17 про 256 чёрный'
         )
         return
-    await run_search(update.effective_message, query_text)
+    await run_search(update.effective_message, query_text, context)
 
 
 def _search_normalize(text):
@@ -1318,7 +1379,77 @@ def _interpret_search_query(query_text):
     return compact
 
 
-async def run_search(message, query_text):
+def _usd_equivalent(offer, rate):
+    try:
+        price = Decimal(str(offer['price']))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    currency = (offer.get('currency') or '').upper()
+    if currency == 'USD':
+        return price
+    if currency == 'BYN' and rate > 0:
+        return price / rate
+    return None
+
+
+def _offer_sort_key(offer, rate):
+    days = offer.get('delivery_workdays')
+    amount = _usd_equivalent(offer, rate)
+    return (days is None, days if days is not None else 9999,
+            amount is None, amount if amount is not None else Decimal('Infinity'),
+            (offer.get('currency') or '').upper(),
+            (offer.get('supplier_name') or '').casefold(),
+            (offer.get('original_name') or '').casefold())
+
+
+def _render_offer(offer, index, rate):
+    result = format_offer(offer, index)
+    days = offer.get('delivery_workdays')
+    when = _delivery_date(days)
+    result += f'\n🚚 Доставка: {_delivery_label(days)}'
+    if when is not None:
+        result += f' (ориентировочно {when})'
+    converted = _usd_equivalent(offer, rate)
+    if converted is not None and (offer.get('currency') or '').upper() == 'BYN':
+        usd = converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        result += f'\n≈ {usd} USD (по курсу {rate} BYN/USD)'
+    return result
+
+
+def _search_nav_keyboard(token, page, pages, full):
+    buttons = []
+    if full:
+        navigation = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton('◀️ Назад', callback_data=f'sr:all:{token}:{page-1}'))
+        navigation.append(InlineKeyboardButton(f'{page+1}/{pages}', callback_data=f'sr:all:{token}:{page}'))
+        if page + 1 < pages:
+            navigation.append(InlineKeyboardButton('Вперёд ▶️', callback_data=f'sr:all:{token}:{page+1}'))
+        buttons.append(navigation)
+        buttons.append([InlineKeyboardButton('↩️ Вернуться к ТОП-20', callback_data=f'sr:top:{token}:0')])
+    else:
+        buttons.append([InlineKeyboardButton('📋 Показать все предложения', callback_data=f'sr:all:{token}:0')])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _send_search_blocks(message, header, offers, rate, offset=0, keyboard=None):
+    # Telegram limit is 4096 characters; split long pages into safe messages.
+    blocks = [header] + [_render_offer(offer, i + offset + 1, rate) for i, offer in enumerate(offers)]
+    chunks, chunk = [], ''
+    for block in blocks:
+        if len(block) > 3600:
+            block = block[:3595] + '…'
+        if chunk and len(chunk) + len(block) + 2 > 3800:
+            chunks.append(chunk)
+            chunk = ''
+        chunk += ('\n\n' if chunk else '') + block
+    if chunk:
+        chunks.append(chunk)
+    for i, value in enumerate(chunks):
+        await message.reply_text(value, reply_markup=keyboard if i == len(chunks) - 1 else None)
+
+
+async def run_search(message, query_text, context):
     query_text = query_text.strip()
     if not query_text:
         await message.reply_text('Напиши название товара для поиска.')
@@ -1330,63 +1461,55 @@ async def run_search(message, query_text):
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
         return
     rate = get_usd_byn_rate()
-    def comparable_price(offer):
-        try:
-            price = Decimal(str(offer['price']))
-        except (InvalidOperation, TypeError, ValueError):
-            return None
-        currency = (offer.get('currency') or '').upper()
-        if currency == 'USD':
-            return price
-        if currency == 'BYN':
-            return price / rate
-        return None
-
-    # VAT is not silently normalized: different VAT statuses stay in separate groups.
-    # Unsupported currencies stay in separate groups and cannot be compared to USD.
-    groups = {}
-    for offer in matches:
-        key = (offer['tax_status'], 'USD-equivalent' if comparable_price(offer) is not None else (offer['currency'] or 'UNKNOWN'))
-        groups.setdefault(key, []).append(offer)
-    selected = []
-    supplier_counts = {}
-    for group_key, offers in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
-        offers.sort(key=lambda o: (comparable_price(o) if comparable_price(o) is not None else Decimal(str(o['price'] or 0)), o['supplier_name'].casefold()))
-        for offer in offers:
-            sid = offer['supplier_id']
-            if supplier_counts.get(sid, 0) >= 3:
-                continue
-            selected.append((group_key, offer))
-            supplier_counts[sid] = supplier_counts.get(sid, 0) + 1
-            if len(selected) >= 20:
-                break
-        if len(selected) >= 20:
+    ordered = sorted(matches, key=lambda o: _offer_sort_key(o, rate))
+    selected, counts = [], {}
+    for offer in ordered:
+        sid = offer['supplier_id']
+        if counts.get(sid, 0) >= 3:
+            continue
+        selected.append(offer)
+        counts[sid] = counts.get(sid, 0) + 1
+        if len(selected) == 20:
             break
+    token = context.user_data.get('search_token', 0) + 1
+    context.user_data['search_token'] = token
+    context.user_data['search_result_snapshot'] = {
+        'token': token, 'query': query_text, 'rate': rate,
+        'all': ordered, 'top': selected,
+    }
+    header = (f'🔎 {query_text}\nНайдено предложений: {len(ordered)}\n'
+              f'Показано: {len(selected)} (не более 3 от поставщика)\n'
+              f'💱 1 USD = {rate} BYN')
+    keyboard = _search_nav_keyboard(token, 0, 1, False) if len(ordered) > len(selected) else None
+    await _send_search_blocks(message, header, selected, rate, keyboard=keyboard)
 
-    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\nПоказано: {len(selected)} (не более 3 от поставщика)\n💱 1 USD = {rate} BYN']
-    previous_group = None
-    for index, (group_key, offer) in enumerate(selected, 1):
-        if group_key != previous_group:
-            vat, comparison_currency = group_key
-            tax_text = {'with_vat': 'с НДС', 'without_vat': 'без НДС', 'unknown': 'НДС не указан'}.get(vat, 'НДС не указан')
-            blocks.append(f'\n📊 {comparison_currency}, {tax_text}')
-            previous_group = group_key
-        item_text = format_offer(offer, index)
-        converted = comparable_price(offer)
-        if converted is not None and offer.get('currency') == 'BYN':
-            usd = converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            item_text += f'\n≈ {usd} USD (по курсу {rate} BYN/USD)'
-        blocks.append(item_text)
-    chunk = ''
-    for block in blocks:
-        if len(block) > 3700:
-            block = block[:3690] + '…'
-        if chunk and len(chunk) + len(block) + 2 > 3800:
-            await message.reply_text(chunk)
-            chunk = ''
-        chunk += ('\n\n' if chunk else '') + block
-    if chunk:
-        await message.reply_text(chunk)
+
+async def search_results_callback(query, context, action):
+    parts = action.split(':')
+    snapshot = context.user_data.get('search_result_snapshot')
+    if len(parts) != 4 or not snapshot or not parts[2].isdigit() or not parts[3].isdigit() or int(parts[2]) != snapshot['token']:
+        await query.message.reply_text('Результаты этого поиска устарели. Повтори запрос.')
+        return
+    mode = parts[1]
+    page = int(parts[3])
+    if mode not in ('all', 'top'):
+        return
+    if mode == 'all':
+        items = snapshot['all']
+        pages = max(1, (len(items) + 19) // 20)
+        if page >= pages:
+            return
+        visible = items[page*20:(page+1)*20]
+        header = (f"🔎 {snapshot['query']} — все предложения\n"
+                  f"Найдено: {len(items)}\nПоказаны: {page*20+1}–{page*20+len(visible)} из {len(items)}")
+        keyboard = _search_nav_keyboard(snapshot['token'], page, pages, True)
+        await _send_search_blocks(query.message, header, visible, snapshot['rate'], page*20, keyboard)
+    else:
+        items = snapshot['top']
+        header = (f"🔎 {snapshot['query']} — ТОП-20\n"
+                  f"Найдено: {len(snapshot['all'])}\nПоказано: {len(items)} (не более 3 от поставщика)")
+        keyboard = _search_nav_keyboard(snapshot['token'], 0, 1, False) if len(snapshot['all']) > len(items) else None
+        await _send_search_blocks(query.message, header, items, snapshot['rate'], keyboard=keyboard)
 
 
 async def cancelrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
