@@ -1223,10 +1223,26 @@ def _search_normalize(text):
 def _offer_matches(query, requested, offer):
     original = offer['original_name']
     found = parse_product(original)
-    if requested['is_accessory'] != found['is_accessory']:
+    if requested['product_role'] != found['product_role']:
         return False
 
-    query_model = requested.get('model')
+    # For families with generations, an unspecified generation means any one.
+    query_family = requested.get('family')
+    if query_family:
+        if found.get('family') != query_family:
+            return False
+        requested_gen = requested.get('generation')
+        if requested_gen is not None and found.get('generation') != requested_gen:
+            return False
+        # Accessory/component queries also need the specified subtype.
+        if requested['product_role'] != 'device':
+            accessory_terms = ('левое ухо', 'правое ухо', 'левый наушник',
+                               'правый наушник', 'charging case', 'зарядный кейс',
+                               'зарядный футляр', 'чехол', 'case', 'cover')
+            requested_kind = [x for x in accessory_terms if x in query.casefold()]
+            if requested_kind and not any(x in original.casefold() for x in requested_kind):
+                return False
+    query_model = None if query_family else requested.get('model')
     # A stored, explicitly recognized model is valid even if the original text
     # is an abbreviation. This supports older rows that retain structured data.
     found_model = found.get('model') or offer.get('model')
@@ -1241,7 +1257,7 @@ def _offer_matches(query, requested, offer):
                 found_model = found.get('model')
         if not found_model or query_model.casefold() != found_model.casefold():
             return False
-    else:
+    elif not query_family:
         if not all(t in _search_normalize(original) for t in _search_normalize(query)):
             return False
 
@@ -1326,39 +1342,38 @@ async def run_search(message, query_text):
             return price / rate
         return None
 
-    # Sort ALL USD/BYN offers by their comparable USD price, regardless of
-    # currency. VAT is displayed on every item; it is NOT silently normalized.
-    # Unknown currencies sort after comparable ones.
-    def sort_key(offer):
-        price = comparable_price(offer)
-        if price is None:
-            try:
-                native_price = Decimal(str(offer['price']))
-            except (InvalidOperation, ValueError, TypeError):
-                native_price = Decimal('Infinity')
-            return (1, str(offer.get('currency') or ''), native_price,
-                    offer['supplier_name'].casefold())
-        return (0, '', price, offer['supplier_name'].casefold())
-
+    # VAT is not silently normalized: different VAT statuses stay in separate groups.
+    # Unsupported currencies stay in separate groups and cannot be compared to USD.
+    groups = {}
+    for offer in matches:
+        key = (offer['tax_status'], 'USD-equivalent' if comparable_price(offer) is not None else (offer['currency'] or 'UNKNOWN'))
+        groups.setdefault(key, []).append(offer)
     selected = []
     supplier_counts = {}
-    for offer in sorted(matches, key=sort_key):
-        sid = offer['supplier_id']
-        if supplier_counts.get(sid, 0) >= 3:
-            continue
-        selected.append(offer)
-        supplier_counts[sid] = supplier_counts.get(sid, 0) + 1
+    for group_key, offers in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+        offers.sort(key=lambda o: (comparable_price(o) if comparable_price(o) is not None else Decimal(str(o['price'] or 0)), o['supplier_name'].casefold()))
+        for offer in offers:
+            sid = offer['supplier_id']
+            if supplier_counts.get(sid, 0) >= 3:
+                continue
+            selected.append((group_key, offer))
+            supplier_counts[sid] = supplier_counts.get(sid, 0) + 1
+            if len(selected) >= 20:
+                break
         if len(selected) >= 20:
             break
 
-    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\n'
-              f'Показано: {len(selected)} (не более 3 от поставщика)\n'
-              f'💱 1 USD = {rate} BYN\n'
-              'Данные результаты результат работы альфа версии']
-    for index, offer in enumerate(selected, 1):
+    blocks = [f'🔎 {query_text}\nНайдено предложений: {len(matches)}\nПоказано: {len(selected)} (не более 3 от поставщика)\n💱 1 USD = {rate} BYN']
+    previous_group = None
+    for index, (group_key, offer) in enumerate(selected, 1):
+        if group_key != previous_group:
+            vat, comparison_currency = group_key
+            tax_text = {'with_vat': 'с НДС', 'without_vat': 'без НДС', 'unknown': 'НДС не указан'}.get(vat, 'НДС не указан')
+            blocks.append(f'\n📊 {comparison_currency}, {tax_text}')
+            previous_group = group_key
         item_text = format_offer(offer, index)
         converted = comparable_price(offer)
-        if converted is not None and (offer.get('currency') or '').upper() == 'BYN':
+        if converted is not None and offer.get('currency') == 'BYN':
             usd = converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             item_text += f'\n≈ {usd} USD (по курсу {rate} BYN/USD)'
         blocks.append(item_text)
