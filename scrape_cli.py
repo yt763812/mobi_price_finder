@@ -20,11 +20,31 @@ def main():
     fetcher = PublicFetcher(shop.domain, user_agent=os.getenv('SCRAPER_USER_AGENT', 'MobiPriceFinder/0.1'))
     html = fetcher.get(url)
     if shop.slug == 'mts':
-        from scrapers.mts import inspect_mts
-        products, issues, card_count = inspect_mts(html, url, args.category)
-        print(f'MTS cards: {card_count}; exact verified: {len(products)}; skipped: {len(issues)}')
+        from scrapers.mts import CardsParser
+        from scrapers.mts_detail import detail_price
+        from urllib.parse import urljoin, urlparse
+        parser = CardsParser()
+        parser.feed(html)
+        products, issues = [], []
+        for card in parser.cards:
+            detail_url = urljoin(url, card.url)
+            if (not card.sku or not card.name or not card.url
+                    or urlparse(detail_url).netloc != shop.domain):
+                issues.append((card.sku or '?', 'invalid product card'))
+                continue
+            try:
+                detail_html = fetcher.get(detail_url)
+                product, error = detail_price(detail_html, detail_url, card.name, card.sku, args.category)
+                if product is None:
+                    issues.append((card.sku, error))
+                else:
+                    products.append(product)
+            except Exception as exc:
+                issues.append((card.sku, f'{type(exc).__name__}: {exc}'))
+        print(f'MTS catalogue cards: {len(parser.cards)}; product page prices: {len(products)}; skipped: {len(issues)}')
         for sku, reason in issues[:12]:
             print(f'  SKIP {sku}: {reason}')
+        print('NOTE: these are advertised public product-page prices, NOT verified legal-entity purchase prices.')
     else:
         products = parse_products(html, url, shop.slug, args.category)
         print(f'{shop.slug}/{args.category}: {len(products)} JSON-LD priced products on first page')
@@ -34,6 +54,8 @@ def main():
         raise SystemExit('No unambiguous full prices; no writes performed')
     if args.dry_run:
         return
+    if shop.slug == "mts":
+        raise SystemExit("MTS database writes are disabled in this diagnostic patch; run with --dry-run")
     import psycopg
     from scrapers.storage import init, save_observations
     if not os.getenv('DATABASE_URL'):
