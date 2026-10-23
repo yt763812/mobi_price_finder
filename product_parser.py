@@ -72,7 +72,8 @@ def detect_storage(text):
     if found:
         amount, unit = found[-1]
         size = int(amount) * (1024 if unit in ("tb", "тб") else 1)
-        return size
+        if size in (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
+            return size
     pair = re.search(r"(?<!\d)(?:4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*[/+]\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
     if pair:
         return int(pair.group(1))
@@ -134,6 +135,7 @@ ACCESSORY_PATTERNS = [
     r"(?<!\w)(?:screen\s*protector|glass\s*protector|tempered\s*glass|защитн\w*\s*стекл\w*|стекло|glass|пленка|плёнка)(?!\w)",
     r"(?<!\w)(?:charger|charging\s*adapter|power\s*adapter|зарядное\s*устройство|зарядка|адаптер\s*питания)(?!\w)",
     r"(?<!\w)(?:phone\s*holder|держатель\s*для\s*телефона|кабель|cable)(?!\w)",
+    r"(?<!\w)(?:keyboard|клавиатура|smart\s*folio|folio\s*cover)(?!\w)",
 ]
 
 
@@ -251,12 +253,56 @@ def detect_other_model(text):
             return brand, (prefix + " " + name).strip()
     return detect_extra_model(text)
 
+# Строгие шаблоны семейств: бренд/семейство должны явно присутствовать.
+# Год выпуска, размер дисплея и чип не считаются моделью или памятью.
+CATALOG_FAMILIES = [
+    ("Apple", r"\b(?:apple\s+)?ipad\s+(?:pro|air|mini)\s*(?:11|13|6|7)?\b", "iPad"),
+    ("Apple", r"\b(?:apple\s+)?ipad\s+(?:10|11)(?:\b|\.)", "iPad"),
+    ("Apple", r"\b(?:apple\s+)?macbook\s+(?:air|pro|neo)\b", "MacBook"),
+    ("Apple", r"\b(?:apple\s+)?mac\s*mini\b", "Mac mini"),
+    ("Samsung", r"\bsamsung\s+(?:galaxy\s+)?(?:watch\s*(?:ultra|classic|[0-9]+)|buds\s*(?:[0-9]+(?:\s*pro)?|pro\s*[0-9]+|fe))\b", "Samsung"),
+    ("Huawei", r"\bhuawei\s+(?:watch\s+(?:gt\s*\d+[a-z]?|fit\s*\d+[a-z]?|ultimate)|band\s*\d+|freebuds\s+\w+\s*\d*|freeclip\s*\d+)\b", "Huawei"),
+    ("Huawei", r"\bhuawei\s+(?:matepad\s+(?:se\s*)?\d+(?:\.\d+)?|pura\s*\d+[a-z]?|nova\s*\d+[a-z]?(?:\s*(?:pro|ultra))?)\b", "Huawei"),
+    ("Google", r"\bgoogle\s+pixel\s+(?:watch|buds)\s*(?:pro|a|\d+)?\b", "Google"),
+    ("Xiaomi", r"\b(?:xiaomi\s+)?(?:poco\s+(?:pad|[cfmx]\s*\d+[a-z]?)(?:\s*(?:pro|ultra))?|redmi\s+(?:pad\s*\w+|a\s*\d+[a-z]?))\b", "Xiaomi"),
+    ("HONOR", r"\bhonor\s+(?:honor\s+)?(?:x\s*\d+[a-z]?(?:\s*pro)?|magic\s*\w+|\d{2,3}[a-z]?)\b", "HONOR"),
+    ("Nothing", r"\bnothing\s+(?:phone\s*\(?\d+[a-z]?\)?|ear\s*\(?[a-z0-9]+\)?)\b", "Nothing"),
+    ("OnePlus", r"\boneplus\s+(?:nord\s+\w+|buds\s+\w+(?:\s*\d+)?|\d+[a-z]?)\b", "OnePlus"),
+    ("Realme", r"\brealme\s+(?:gt\s+\w+|\d+\s*(?:pro|plus)?)\b", "Realme"),
+]
+
+
+def detect_catalog_model(text):
+    t = normalize(text)
+    # Never promote an accessory mentioning a compatible model to a device.
+    if product_role(text) != 'device':
+        return None, None
+    for brand, pattern, _ in CATALOG_FAMILIES:
+        m = re.search(pattern, t, re.I)
+        if m:
+            model = re.sub(r'\s+', ' ', m.group(0)).strip()
+            if brand == 'Apple' and model.startswith('apple '):
+                model = model[6:]
+            if brand in ('Samsung', 'Huawei', 'Google', 'HONOR', 'Nothing', 'OnePlus', 'Realme'):
+                model = re.sub(r'^(?:' + re.escape(brand) + r')\s+', '', model, flags=re.I)
+            return brand, model
+    return None, None
+
+
 def detect_ram(text):
     t = normalize(text)
-    pair = re.search(r"(?<!\d)(4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?\s*[/+]\s*(64|128|256|512|1024|2048)\s*(?:gb|гб|g)?(?!\d)", t)
+    # Memory pairs: 8/256, 8Gb 256Gb, 12GB+512GB.
+    # Require storage capacity as second element to avoid CPU identifiers.
+    size = r'(?:64|128|256|512|1024|2048)'
+    ram = r'(?:4|6|8|12|16|18|24|32|48|64|96)'
+    pair = re.search(r'(?<![\w.])(' + ram + r')\s*(?:gb|гб|g)?\s*[/+]\s*(' + size + r')\s*(?:gb|гб|g|tb|тб)?(?!\w)', t)
     if pair:
         return int(pair.group(1))
-    match = re.search(r"(?<!\w)(?:ram|озу|оперативная память)\s*[:\-]?\s*(4|6|8|12|16|18|24|32|64)\s*(?:gb|гб|g)?(?!\w)", t)
+    # Explicit dual size, e.g. 8Gb 256Gb; avoid a lone 8GB in accessory names.
+    pair = re.search(r'(?<![\w.])(' + ram + r')\s*(?:gb|гб)\s+(' + size + r')\s*(?:gb|гб|tb|тб)(?!\w)', t)
+    if pair:
+        return int(pair.group(1))
+    match = re.search(r'(?<!\w)(?:ram|озу|оперативная память)\s*[:\-]?\s*(' + ram + r')\s*(?:gb|гб|g)?(?!\w)', t)
     return int(match.group(1)) if match else None
 
 
@@ -330,6 +376,10 @@ def parse_product(text):
     other_brand, other_model = detect_other_model(text) if not model else (None, None)
     if not model:
         model = other_model
+    if not model:
+        catalog_brand, catalog_model = detect_catalog_model(text)
+        if catalog_model:
+            other_brand, model = catalog_brand, catalog_model
     # A bundle changes the commercial SKU. Until it is modeled explicitly,
     # store it by full original name rather than a lossy base-model signature.
     if model and has_unmodeled_bundle(text):
