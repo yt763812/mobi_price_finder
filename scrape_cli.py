@@ -19,12 +19,19 @@ def main():
     url = shop.categories[args.category]
     fetcher = PublicFetcher(shop.domain, user_agent=os.getenv('SCRAPER_USER_AGENT', 'MobiPriceFinder/0.1'))
     html = fetcher.get(url)
-    products = parse_products(html, url, shop.slug, args.category)
-    print(f'{shop.slug}/{args.category}: {len(products)} JSON-LD priced products on first page')
+    if shop.slug == 'mts':
+        from scrapers.mts import inspect_mts
+        products, issues, card_count = inspect_mts(html, url, args.category)
+        print(f'MTS cards: {card_count}; exact verified: {len(products)}; skipped: {len(issues)}')
+        for sku, reason in issues[:12]:
+            print(f'  SKIP {sku}: {reason}')
+    else:
+        products = parse_products(html, url, shop.slug, args.category)
+        print(f'{shop.slug}/{args.category}: {len(products)} JSON-LD priced products on first page')
     for p in products[:8]:
         print(f'{p.name}: {p.price} {p.currency} — {p.url}')
     if not products:
-        raise SystemExit('No verified structured product prices; no writes performed')
+        raise SystemExit('No unambiguous full prices; no writes performed')
     if args.dry_run:
         return
     import psycopg
