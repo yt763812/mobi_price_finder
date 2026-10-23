@@ -327,13 +327,15 @@ def _prepare_import(rows):
         except (ValueError, ArithmeticError, __import__('decimal').InvalidOperation):
             rejected.append((product.get('original', ''), 'некорректная цена'))
             continue
-        original = ' '.join(product.get('original', '').split())
+        # Deduplicate only byte-for-byte identical source names (ignoring
+        # padding around the cell). Normalising internal whitespace/case here
+        # silently collapses distinct catalogue rows, e.g. two-space vs
+        # one-space supplier names or Maunfeld vs MAUNFELD.
+        original = str(product.get('original') or '').strip()
         if not original:
             rejected.append(('', 'отсутствует название'))
             continue
-        # Distinct raw names remain separate even when the parser does not
-        # understand a new product category or a commercial modification.
-        signature = hashlib.sha256(original.casefold().encode('utf-8')).hexdigest()
+        signature = hashlib.sha256(original.encode('utf-8')).hexdigest()
         if signature not in unique or amount < unique[signature][1]:
             unique[signature] = (product, amount)
     return unique, rejected
