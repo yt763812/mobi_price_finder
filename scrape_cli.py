@@ -1,68 +1,68 @@
-"""Manual diagnostic collector; not yet a production full-catalogue scraper.
+"""Public web prices. MTS --dry-run works without DATABASE_URL.
 
-Usage: python scrape_cli.py --shop mts --category smartphones --dry-run
+Examples:
+  python scrape_cli.py --shop mts --category smartphones --dry-run --max-pages 2
+  python scrape_cli.py --shop mts --category smartphones --dry-run
+  python scrape_cli.py --shop mts --category smartphones --save
 """
 import argparse
 import os
 from scrapers.core import PublicFetcher, parse_products
 from scrapers.shops import SHOPS
 
+
 def main():
-    cli = argparse.ArgumentParser()
-    cli.add_argument('--shop', required=True, choices=SHOPS)
-    cli.add_argument('--category', required=True, choices=('smartphones','tablets','watches','headphones'))
-    cli.add_argument('--dry-run', action='store_true')
-    args = cli.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--shop', choices=SHOPS, required=True)
+    parser.add_argument('--category', choices=('smartphones','tablets','watches','headphones'), required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--dry-run', action='store_true')
+    mode.add_argument('--save', action='store_true', help='Explicitly write verified observations to database')
+    parser.add_argument('--max-pages', type=int, default=50)
+    args = parser.parse_args()
+    if not (1 <= args.max_pages <= 100):
+        parser.error('--max-pages must be between 1 and 100')
     shop = SHOPS[args.shop]
     if args.category not in shop.categories:
-        raise SystemExit(f'{shop.slug}/{args.category}: URL not verified; do not guess')
+        parser.error('Category URL not configured/verified for this shop')
+    if args.shop != 'mts' and args.save:
+        parser.error('--save currently enabled only for MTS')
+    fetcher = PublicFetcher(shop.domain, delay=2.0,
+                            user_agent=os.getenv('SCRAPER_USER_AGENT', 'MobiPriceFinder/0.1'))
     url = shop.categories[args.category]
-    fetcher = PublicFetcher(shop.domain, user_agent=os.getenv('SCRAPER_USER_AGENT', 'MobiPriceFinder/0.1'))
-    html = fetcher.get(url)
-    if shop.slug == 'mts':
-        from scrapers.mts import CardsParser
-        from scrapers.mts_detail import detail_price
-        from urllib.parse import urljoin, urlparse
-        parser = CardsParser()
-        parser.feed(html)
-        products, issues = [], []
-        for card in parser.cards:
-            detail_url = urljoin(url, card.url)
-            if (not card.sku or not card.name or not card.url
-                    or urlparse(detail_url).netloc != shop.domain):
-                issues.append((card.sku or '?', 'invalid product card'))
-                continue
-            try:
-                detail_html = fetcher.get(detail_url)
-                product, error = detail_price(detail_html, detail_url, card.name, card.sku, args.category)
-                if product is None:
-                    issues.append((card.sku, error))
-                else:
-                    products.append(product)
-            except Exception as exc:
-                issues.append((card.sku, f'{type(exc).__name__}: {exc}'))
-        print(f'MTS catalogue cards: {len(parser.cards)}; product page prices: {len(products)}; skipped: {len(issues)}')
-        for sku, reason in issues[:12]:
+    if args.shop == 'mts':
+        from scrapers.mts_crawl import crawl_mts
+        result = crawl_mts(fetcher, url, args.category, max_pages=args.max_pages)
+        products = result.products
+        print(f'MTS {args.category}: pages={result.pages}, cards={result.cards}, '
+              f'priced={len(products)}, skipped={len(result.issues)}, '
+              f'page_limit_reached={result.incomplete}', flush=True)
+        for sku, reason in result.issues[:20]:
             print(f'  SKIP {sku}: {reason}')
-        print('NOTE: these are advertised public product-page prices, NOT verified legal-entity purchase prices.')
     else:
-        products = parse_products(html, url, shop.slug, args.category)
-        print(f'{shop.slug}/{args.category}: {len(products)} JSON-LD priced products on first page')
-    for p in products[:8]:
-        print(f'{p.name}: {p.price} {p.currency} — {p.url}')
-    if not products:
-        raise SystemExit('No unambiguous full prices; no writes performed')
-    if args.dry_run:
+        products = parse_products(fetcher.get(url), url, shop.slug, args.category)
+        print(f'{shop.slug}/{args.category}: {len(products)} JSON-LD products on FIRST page only')
+        result = None
+    for product in products[:10]:
+        print(f'{product.name}: {product.price} {product.currency} — {product.url}')
+    print('Prices are PUBLIC advertised prices, NOT confirmed B2B procurement prices.')
+    if not args.save:
+        print('DRY RUN: no database changes')
         return
-    if shop.slug == "mts":
-        raise SystemExit("MTS database writes are disabled in this diagnostic patch; run with --dry-run")
+    if result.incomplete or result.issues:
+        raise SystemExit('Database unchanged: incomplete crawl or skipped products; inspect output first')
+    if not products:
+        raise SystemExit('Database unchanged: no trustworthy products')
     import psycopg
     from scrapers.storage import init, save_observations
-    if not os.getenv('DATABASE_URL'):
+    dsn = os.getenv('DATABASE_URL')
+    if not dsn:
         raise SystemExit('DATABASE_URL must be configured')
-    with psycopg.connect(os.environ['DATABASE_URL']) as conn:
+    with psycopg.connect(dsn) as conn:
         init(conn)
         save_observations(conn, shop.slug, args.category, products)
+    print(f'Saved {len(products)} web observations; existing manual supplier offers untouched')
+
 
 if __name__ == '__main__':
     main()
