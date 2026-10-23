@@ -1449,14 +1449,47 @@ async def _send_search_blocks(message, header, offers, rate, offset=0, keyboard=
         await message.reply_text(value, reply_markup=keyboard if i == len(chunks) - 1 else None)
 
 
+def _search_prefilter_anchor(text, requested):
+    """Choose one safe substring to cut DB->Python traffic.
+
+    Prefer distinctive model numbers/family names. Using one fragment (not
+    all tokens) preserves abbreviations and supplier-specific descriptions.
+    No good fragment => old exhaustive behavior.
+    """
+    model = (requested.get('model') or '')
+    family = (requested.get('family') or '')
+    if family:
+        if 'airpods' in family.casefold():
+            return 'airpods'
+        if 'watch' in family.casefold():
+            return 'watch'
+    if model:
+        # '17' matches both abbreviated '17 Pro' and full iPhone names.
+        candidates = re.findall(r'(?<!\w)\d{2,3}[a-z]?(?!\w)', model.casefold())
+        if candidates:
+            return candidates[0]
+        if 'iphone air' in model.casefold():
+            return 'air'
+        words = re.findall(r'[a-zа-я]{4,}', model.casefold())
+        if words:
+            return words[0]
+    # For unknown categories use a literal term only when it is distinctive;
+    # short and ambiguous queries are deliberately scanned exhaustively.
+    words = re.findall(r'[a-zа-я0-9]+', text.casefold())
+    words = [w for w in words if len(w) >= 4 and w not in {'pro', 'max', 'plus', 'with', 'case'}]
+    return max(words, key=len) if words else None
+
+
 async def run_search(message, query_text, context):
     query_text = query_text.strip()
     if not query_text:
         await message.reply_text('Напиши название товара для поиска.')
         return
-    requested = parse_product(_interpret_search_query(query_text))
-    matches = [o for o in search_offers()
-               if o['is_fresh'] and _offer_matches(query_text, requested, o)]
+    interpreted = _interpret_search_query(query_text)
+    requested = parse_product(interpreted)
+    anchor = _search_prefilter_anchor(query_text, requested)
+    matches = [o for o in search_offers(anchor)
+               if _offer_matches(query_text, requested, o)]
     if not matches:
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
         return
