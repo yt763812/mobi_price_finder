@@ -82,6 +82,18 @@ def init_db():
                 ON offers(model, storage_gb, color)
             """)
 
+    # Accelerates substring prefilter without changing stored offers.
+    # Optional: some managed PostgreSQL roles cannot install extensions.
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_offers_original_trgm ON offers USING gin (original_name gin_trgm_ops)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_offers_model_trgm ON offers USING gin (model gin_trgm_ops)")
+    except psycopg.Error:
+        # The SQL prefilter still works without the optional acceleration index.
+        pass
+
 
 def add_supplier(name, telegram_user_id=None, validity_hours=72):
     """Return an existing or new supplier ID; don't silently reassign Telegram IDs."""
@@ -391,16 +403,35 @@ def save_excel_rows(supplier_id, rows, currency, tax_status):
     return _replace_supplier_offers(supplier_id, rows, currency, tax_status)
 
 
-def search_offers():
-    """Read all current supplier offers including unrecognized categories."""
+def search_offers(anchor=None):
+    """Return current offers narrowed by a conservative name/model fragment.
+
+    An anchor is a broad prefilter, not a replacement for the precise Python
+    match (which handles models, variants, and accessories). The parameter is
+    optional so existing callers retain their previous behavior.
+    """
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.*, s.name AS supplier_name, s.delivery_workdays,
-                    (o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour') AS is_fresh
-                FROM offers o JOIN suppliers s ON s.id=o.supplier_id
-                ORDER BY s.name, o.original_name
-            """)
+            if anchor:
+                # Escape LIKE wildcards: an anchor is literal user text.
+                escaped = anchor.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                pattern = '%' + escaped + '%'
+                cur.execute("""
+                    SELECT o.*, s.name AS supplier_name, s.delivery_workdays,
+                        TRUE AS is_fresh
+                    FROM offers o JOIN suppliers s ON s.id=o.supplier_id
+                    WHERE o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour'
+                      AND (o.original_name ILIKE %s ESCAPE '\\'
+                           OR o.model ILIKE %s ESCAPE '\\'
+                           OR o.brand ILIKE %s ESCAPE '\\')
+                """, (pattern, pattern, pattern))
+            else:
+                cur.execute("""
+                    SELECT o.*, s.name AS supplier_name, s.delivery_workdays,
+                        TRUE AS is_fresh
+                    FROM offers o JOIN suppliers s ON s.id=o.supplier_id
+                    WHERE o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour'
+                """)
             return cur.fetchall()
 
 
