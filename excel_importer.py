@@ -6,15 +6,15 @@ from collections import Counter
 from openpyxl import load_workbook
 from product_parser import parse_product, section_brand, contextual_name
 
-NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название', 'название товара', 'товар', 'product', 'model', 'item', 'description')
-PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная')
+NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название', 'название товара', 'раздел / наименование', 'товар', 'product', 'model', 'item', 'description')
+PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная', 'цена прайса с ндс', 'алтерн-цена без ндс', 'алтерн-цена с ндс')
 BRAND_HEADERS = ('бренд', 'брэнд', 'brand', 'производитель')
 COLOR_HEADERS = ('цвет', 'color', 'colour')
 REGION_HEADERS = ('происхождение', 'регион', 'страна', 'region')
 CATEGORY_HEADERS = ('категория', 'category')
 BAD_PRICE = ('итого', 'total', 'сумма', 'розница', 'retail', 'ррц')
 MAX_FILE_BYTES = 12 * 1024 * 1024
-MAX_ROWS = 60000
+MAX_ROWS = 150000
 
 
 def _clean(value):
@@ -25,16 +25,25 @@ def _header(value):
     return re.sub(r'\s+', ' ', _clean(value).casefold())
 
 
-def _preferred_price(row):
+def _preferred_price(row, tax_status="with_vat"):
     """Prefer explicit purchase prices; VAT inclusive where the file offers it."""
     indices = _indices(row, PRICE_HEADERS)
     def rank(i):
         value = _header(row[i])
-        if value == 'цена с ндс': return (0, i)
-        if value == 'цена без ндс': return (1, i)
-        if 'usd' in value or '$' in value: return (2, i)
-        if value == 'цена розничная': return (5, i)
-        return (3, i)
+        # Supplier promotional wholesale prices outrank list prices and RRP.
+        # Never silently substitute an opposite VAT column for a labelled one.
+        if tax_status == 'with_vat':
+            priorities = {'алтерн-цена с ндс': 0, 'цена с ндс': 1,
+                          'цена прайса с ндс': 2, 'алтерн-цена без ндс': 8,
+                          'цена без ндс': 8}
+        else:
+            priorities = {'алтерн-цена без ндс': 0, 'цена без ндс': 1,
+                          'алтерн-цена с ндс': 8, 'цена с ндс': 8,
+                          'цена прайса с ндс': 8}
+        if value in priorities: return (priorities[value], i)
+        if any(x in value for x in ('ррц', 'розничная')): return (10, i)
+        if 'usd' in value or '$' in value: return (3, i)
+        return (4, i)
     return sorted(indices, key=rank)
 
 
@@ -175,6 +184,8 @@ def inspect_xlsx(data, tax_status='with_vat'):
     try:
         sheets = []
         for ws in wb.worksheets:
+            if _header(ws.title) in ('информация', 'сервис'):
+                continue
             multi = _multirow_price_mapping(ws, tax_status)
             if multi and multi['status'] != 'ok':
                 sheets.append({'sheet': ws.title, 'status': 'unknown'})
@@ -185,7 +196,7 @@ def inspect_xlsx(data, tax_status='with_vat'):
             ambiguous = False
             for row_num, row in enumerate(ws.iter_rows(min_row=1, max_row=25, values_only=True), 1):
                 names = _indices(row, NAME_HEADERS)
-                prices = _preferred_price(row)
+                prices = _preferred_price(row, tax_status)
                 brands = _indices(row, BRAND_HEADERS)
                 categories = _indices(row, CATEGORY_HEADERS)
                 colors = _indices(row, COLOR_HEADERS)
@@ -245,14 +256,14 @@ def inspect_xlsx(data, tax_status='with_vat'):
                         'sim': parsed.get('sim'),
                         'warnings': parsed.get('warnings', []),
                     })
-                if parse_product(full_name).get('warnings'):
+                if valid <= 100 and parse_product(full_name).get('warnings'):
                     uncertain += 1
             sheets.append({'sheet': ws.title, 'status': 'preview', 'header_row': header_row,
                            'mapping': mapping, 'ambiguous': ambiguous,
                            'price_header': price_header,
                            'named': count, 'valid': valid, 'no_price': no_price,
                            'samples': samples, 'parsed_samples': parsed_samples,
-                           'uncertain': uncertain,
+                           'uncertain': uncertain, 'uncertain_sampled': valid > 100,
                            'truncated': bool(ws.max_row and ws.max_row > MAX_ROWS)})
         return sheets
     finally:
