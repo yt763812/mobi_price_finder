@@ -1,27 +1,29 @@
-# Mobi Price Finder
+# Mobi Price Finder — web catalog integration (experimental foundation)
 
-Telegram bot for importing supplier price lists (Telegram text or XLSX) and searching offers across suppliers.
+This is an **additive prototype**, not a claim that four complete catalogue scrapers are working.
 
-## New import behavior
+## Tested scope
+- JSON-LD `Product` / `Offer` extractor and unit tests.
+- Separate PostgreSQL tables (`web_offers`, `web_price_history`, `web_scrape_runs`).
+- No changes to the current `suppliers` / `offers` tables or bot.
+- No deletion of prices due to partial crawls.
+- Known category entry points for A1 and MTS; DNS/NSV require verification.
 
-After a successful confirmed import, **all previous offers of the selected supplier are replaced** in one database transaction. Other suppliers' offers are unchanged. If a file cannot be imported or has no valid rows, the old list stays intact. A new import is the complete snapshot for that supplier; if a supplier sends several separate files, each subsequent file replaces the previous one.
+## Run
+Copy `scrapers/` and `scrape_cli.py` alongside `bot.py`. Your project's existing psycopg dependency is sufficient.
 
-Both text and Excel imports retain products not recognized by the model parser, using original names. Exact repeated product names within a price list are collapsed to the lowest price, but different names and variants stay separate.
+```bash
+python -m unittest discover -s tests -v
+python scrape_cli.py --shop mts --category smartphones --dry-run
+DATABASE_URL=... python scrape_cli.py --shop mts --category smartphones
+```
 
-## Search
+**Important:** The CLI reads only the first catalogue page; if there is no JSON-LD with complete full-purchase BYN price it exits without writing. It does not infer prices from installment amounts. The script deliberately does not paginate, classify promotional conditions, or merge into Telegram search until site-specific extraction can be validated. Never schedule it as a reliable two-daily full catalogue updater in its current state.
 
-Send a product query without memory, e.g. `iphone 17 pro`, to list matching lines from **all currently fresh supplier price lists**. Results include supplier, original name, price, currency, VAT, storage, color, SIM type, region, and condition. Missing details are displayed as «Не указан» (condition: «Не указано»). They are sorted by price within each currency/VAT group, but different currencies and VAT types are never ranked against one another. More specific queries, such as `iphone 17 pro 256`, filter storage when recognized. Unrecognized models and categories use word matching against original names.
-
-## Limitations
-
-Excel importer supports `.xlsx` with recognizable name and price headers on a single unambiguous sheet. Arbitrary supplier Excel formats (merged headers, multiple sheets, price columns without supported names) still require importer enhancements. Text messages must contain parseable item/price pairs. For large catalogs the current Python-side all-offers search should be replaced with database-backed indexing. Testing against Telegram and a live PostgreSQL database is still required.
-
-Install the packages listed in `requirements.txt`; configure `DATABASE_URL`, `BOT_TOKEN`, and `OWNER_TELEGRAM_ID` as before.
-
-## Deployment
-
-Set `TELEGRAM_BOT_TOKEN`, `DATABASE_URL`, `OWNER_TELEGRAM_ID` in your deployment environment. Install `requirements.txt`, then run `python bot.py`. Choose a supplier, configure currency and VAT, upload XLSX or text, review preview, confirm replacement. Send a product name or `/find iphone 17 pro 256gb` to search all fresh suppliers. Changing the selected supplier does not delete any other supplier data. The bot does not infer a missing SIM type or region.
-
-## Verified sample Excel files
-
-Stock MSK: sheet `CRM_Trade`, 108 rows with prices; BLUE: sheet `13.10.2026`, 3093 rows with prices. This is file parsing, not a live PostgreSQL or Telegram end-to-end test.
+## Next integration tasks
+1. Validate current `robots.txt`, category URLs, site terms and actual HTML responses on deployment host.
+2. Implement site-specific extractors (including full buy-now prices, promotional conditions, availability and product variants).
+3. Discover and exhaust safe pagination; check count/completeness before replacing any catalogue snapshot.
+4. Extend the bot search layer to join normalized online prices with supplier offers (distinguish public retail / B2B-verified).
+5. Add bounded scheduler (twice daily), failed-run logging and monitoring.
+6. DNS and NSV category routes need concrete confirmation before enablement.
