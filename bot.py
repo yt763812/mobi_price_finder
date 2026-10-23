@@ -17,6 +17,7 @@ from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
 )
+from mts_daily_scheduler import post_init as mts_post_init
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
@@ -1558,7 +1559,7 @@ def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_init(mts_post_init).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
