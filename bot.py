@@ -560,7 +560,10 @@ async def excel_review(message, context):
                 if parsed.get('warnings'):
                     lines.append('   ⚠️ '+'; '.join(parsed['warnings'])[:130])
             if item.get('uncertain'):
-                lines.append(f'⚠️ Неоднозначные характеристики: {item["uncertain"]} строк(и). Исходные названия сохраняются.')
+                if item.get('uncertain_sampled'):
+                    lines.append(f'⚠️ Неоднозначные характеристики в выборке первых 100 товаров: {item["uncertain"]}. Исходные названия сохраняются.')
+                else:
+                    lines.append(f'⚠️ Неоднозначные характеристики: {item["uncertain"]} строк(и). Исходные названия сохраняются.')
         elif item.get('skipped'):
             lines.append('⏭ '+item['sheet']+' — пропущен')
         else:
