@@ -893,16 +893,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Поставщик не найден")
             return
         context.user_data['supplier_id'] = sid
-        await query.message.reply_text(f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, is_owner(update)))
+        await query.message.reply_text(f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, allowed(update)))
         await show_pending(query.message, context)
     elif action.startswith('supplier:'):
         parts = action.split(':')
         if len(parts) != 3 or not parts[2].isdigit():
             return
         operation, sid = parts[1], int(parts[2])
-        if operation in ('delete', 'confirm_delete') and not is_owner(update):
-            await query.message.reply_text('🔒 Удалять поставщиков может только владелец бота.')
-            return
         s = get_supplier(sid)
         if not s:
             await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
@@ -938,14 +935,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif operation == 'cancel_rename':
             if context.user_data.get('await_rename_id') == sid:
                 context.user_data.pop('await_rename_id', None)
-            await query.message.reply_text('Изменение названия отменено.', reply_markup=supplier_manage_keyboard(s, is_owner(update)))
+            await query.message.reply_text('Изменение названия отменено.', reply_markup=supplier_manage_keyboard(s, allowed(update)))
         elif operation == 'delete':
             await query.message.reply_text(
                 f"⚠️ Удалить «{s['name']}» и ВСЕ его сохранённые товары? "
                 "Это действие нельзя отменить.", reply_markup=supplier_delete_keyboard(sid)
             )
         elif operation == 'cancel_delete':
-            await query.message.reply_text('Удаление отменено.', reply_markup=supplier_manage_keyboard(s, is_owner(update)))
+            await query.message.reply_text('Удаление отменено.', reply_markup=supplier_manage_keyboard(s, allowed(update)))
         elif operation == 'confirm_delete':
             deleted = delete_supplier(sid)
             if deleted:
