@@ -3,6 +3,7 @@
 This is a diagnostic mode, not proof of B2B eligibility or absence of conditions.
 """
 from dataclasses import dataclass
+import hashlib
 from decimal import Decimal
 from urllib.parse import urljoin, urlparse
 from scrapers.mts import CardsParser, read_price
@@ -35,6 +36,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         raise ValueError('Invalid crawl limits')
     todo = [(1, catalogue_url)]
     visited = set()
+    seen_urls = set()
     products = {}
     issues = []
     cards_total = 0
@@ -52,7 +54,16 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         parser.feed(html)
         if not parser.cards:
             raise RuntimeError(f'No MTS catalogue cards on {page_url}')
+        # Out-of-range MTS page numbers may return the first page again.
+        # A page containing NO unseen product URLs is a terminal duplicate,
+        # not a real extra catalogue page. Never count its cards.
+        page_urls = {urljoin(page_url, c.url or '') for c in parser.cards if c.url}
+        if page_urls and page_urls.issubset(seen_urls):
+            print(f'MTS catalog-only {category}: terminal repeated page {n}; '
+                  f'counting {len(visited)} genuine pages', flush=True)
+            break
         visited.add(n)
+        seen_urls.update(page_urls)
         cards_total += len(parser.cards)
         if cards_total > max_products:
             incomplete = True
@@ -70,11 +81,17 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                 continue
             offer = CatalogOffer(card.sku, card.name, url, price, 'BYN',
                                  card.approximate, card.availability, card.ga_price)
-            old = products.get(card.sku)
-            if old is not None and (old.url != offer.url or old.price != offer.price):
-                issues.append((card.sku, 'same SKU has different URL or price across catalogue pages'))
+            # The site's GA SKU is not necessarily unique: several different
+            # links may share it. Disambiguate with stable URL-derived keys,
+            # while rejecting contradictory prices for the SAME URL.
+            # All keys are stable across page order and daily runs.
+            key = hashlib.sha256(url.encode('utf-8')).hexdigest()
+            old = products.get(key)
+            if old is not None and old.price != offer.price:
+                issues.append((card.sku, f'conflicting prices for identical URL {url}: '
+                                         f'{old.price} vs {offer.price}'))
                 continue
-            products[card.sku] = offer
+            products[key] = offer
         print(f'MTS catalog-only {category}: pages={len(visited)}, cards={cards_total}, '
               f'priced={len(products)}, issues={len(issues)}', flush=True)
         links = PaginationLinks()
