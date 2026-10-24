@@ -19,20 +19,27 @@ def main():
     mode.add_argument('--dry-run', action='store_true')
     mode.add_argument('--save', action='store_true', help='Explicitly write verified observations to database')
     parser.add_argument('--max-pages', type=int, default=50)
+    parser.add_argument('--catalog-only', action='store_true', help='MTS: fast catalogue-listed prices; diagnostic only, no database writes')
     args = parser.parse_args()
     if not (1 <= args.max_pages <= 100):
         parser.error('--max-pages must be between 1 and 100')
     shop = SHOPS[args.shop]
     if args.category not in shop.categories:
         parser.error('Category URL not configured/verified for this shop')
+    if args.catalog_only and (args.shop != 'mts' or args.save or not args.dry_run):
+        parser.error('--catalog-only requires --shop mts --dry-run (database writes disabled)')
     if args.shop != 'mts' and args.save:
         parser.error('--save currently enabled only for MTS')
     fetcher = PublicFetcher(shop.domain, delay=2.0,
                             user_agent=os.getenv('SCRAPER_USER_AGENT', 'MobiPriceFinder/0.1'))
     url = shop.categories[args.category]
     if args.shop == 'mts':
-        from scrapers.mts_crawl import crawl_mts
-        result = crawl_mts(fetcher, url, args.category, max_pages=args.max_pages)
+        if args.catalog_only:
+            from scrapers.mts_catalog import crawl_mts_catalog
+            result = crawl_mts_catalog(fetcher, url, args.category, max_pages=args.max_pages)
+        else:
+            from scrapers.mts_crawl import crawl_mts
+            result = crawl_mts(fetcher, url, args.category, max_pages=args.max_pages)
         products = result.products
         print(f'MTS {args.category}: pages={result.pages}, cards={result.cards}, '
               f'priced={len(products)}, skipped={len(result.issues)}, '
@@ -44,7 +51,10 @@ def main():
         print(f'{shop.slug}/{args.category}: {len(products)} JSON-LD products on FIRST page only')
         result = None
     for product in products[:10]:
-        print(f'{product.name}: {product.price} {product.currency} — {product.url}')
+        marker = ' [ОТ; условия нужно проверить]' if args.catalog_only and product.approximate else ''
+        print(f'{product.name}: {product.price} {product.currency}{marker} — {product.url}')
+    if args.catalog_only:
+        print('CATALOG-ONLY: prices are catalogue observations, NOT verified unconditional or B2B prices; no DB writes')
     print('Prices are PUBLIC advertised prices, NOT confirmed B2B procurement prices.')
     if not args.save:
         print('DRY RUN: no database changes')
