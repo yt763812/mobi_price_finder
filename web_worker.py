@@ -25,6 +25,11 @@ class StoredOffer:
 
 def run(categories, max_pages=50, report=None):
     """Return 0 on success, 2 on validation/error, 3 when already running."""
+    # Full-store mode is opt-in. Existing five-category behavior is unchanged.
+    if (os.getenv('MTS_FULL_STORE_ENABLED', '0') == '1'
+            and set(categories) == set(CATEGORIES)):
+        from mts_full_store_worker import run_full_store
+        return run_full_store(max_pages=max_pages, report=report)
     import psycopg
     from scrapers.core import PublicFetcher
     from scrapers.mts_catalog import crawl_mts_catalog
