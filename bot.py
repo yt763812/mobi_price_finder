@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import hashlib
+import asyncio
 from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta
@@ -17,8 +18,6 @@ from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
 )
-from mts_daily_scheduler import post_init as mts_post_init
-import a1_bot_integration
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
@@ -516,7 +515,7 @@ def excel_menu(stage):
     buttons = []
     for i, item in enumerate(stage['sheets']):
         mark = '✅' if item.get('enabled') else '⏭' if item.get('skipped') else '⚠️'
-        buttons.append([InlineKeyboardButton(f'{mark} {item["sheet"][:40]}', callback_data=f'xm:sheet:{i}')])
+        buttons.append([InlineKeyboardButton(f'{mark} {item.get("file_name", "")[:16]} · {item["sheet"][:20]}', callback_data=f'xm:sheet:{i}')])
     buttons.append([InlineKeyboardButton('✅ Предпросмотр и сохранение', callback_data='xm:review')])
     buttons.append([InlineKeyboardButton('❌ Отмена', callback_data='excel:cancel')])
     return InlineKeyboardMarkup(buttons)
@@ -538,8 +537,14 @@ def excel_sheet_menu(stage, index):
 
 
 def staged_excel_ready(stage):
-    return all(item.get('enabled') or item.get('skipped') for item in stage['sheets']) and any(
-        item.get('enabled') for item in stage['sheets'])
+    sheets = stage['sheets']
+    if not all(item.get('enabled') or item.get('skipped') for item in sheets):
+        return False
+    if not stage.get('files'):
+        return any(item.get('enabled') for item in sheets)
+    # Each attached file must contribute at least one enabled sheet.
+    return all(any(sheet.get('enabled') for sheet in attached['sheets'])
+               for attached in stage['files'])
 
 
 async def excel_review(message, context):
@@ -547,10 +552,10 @@ async def excel_review(message, context):
     if not stage or stage['expires'] < time.time():
         await message.reply_text('Настройка истекла. Пришли Excel ещё раз.')
         return
-    lines = ['📊 Excel — проверка перед импортом', 'Поставщик: '+stage['supplier_name']]
+    lines = ['📊 Excel — проверка перед импортом', 'Поставщик: '+stage['supplier_name'], f'Файлов: {len(stage.get("files", [1]))}']
     for item in stage['sheets']:
         if item.get('enabled'):
-            lines.append(f'✅ {item["sheet"]}: {item["valid"]} строк')
+            lines.append(f'✅ {item.get("file_name", "Excel")} / {item["sheet"]}: {item["valid"]} строк')
             lines.extend('• '+v for v in item.get('samples', [])[:2])
             for parsed in item.get('parsed_samples', [])[:2]:
                 display = lambda v: str(v) if v is not None else 'Не указан'
@@ -567,9 +572,9 @@ async def excel_review(message, context):
                 else:
                     lines.append(f'⚠️ Неоднозначные характеристики: {item["uncertain"]} строк(и). Исходные названия сохраняются.')
         elif item.get('skipped'):
-            lines.append('⏭ '+item['sheet']+' — пропущен')
+            lines.append('⏭ '+item.get('file_name', 'Excel')+' / '+item['sheet']+' — пропущен')
         else:
-            lines.append('⚠️ '+item['sheet']+' — требует настройки')
+            lines.append('⚠️ '+item.get('file_name', 'Excel')+' / '+item['sheet']+' — требует настройки')
     lines.append('Никакие товары ещё не сохранены. При подтверждении прежний прайс выбранного поставщика будет заменён.')
     keyboard = [[InlineKeyboardButton('🛠 Настроить листы', callback_data='xm:list')]]
     if staged_excel_ready(stage):
@@ -608,7 +613,7 @@ async def excel_manual_callback(query, context, action):
         field = parts[3]
         if field not in EXCEL_FIELDS:
             return
-        columns = sheet_columns(stage['data'], item['sheet'])
+        columns = sheet_columns(item.get('data', stage['data']), item['sheet'])
         choices = []
         if field not in ('name', 'price'):
             choices.append([InlineKeyboardButton('Не использовать', callback_data=f'xm:setcol:{idx}:{field}:x')])
@@ -631,7 +636,7 @@ async def excel_manual_callback(query, context, action):
         if mapping.get('name') is None or mapping.get('price') is None or mapping['name'] == mapping['price']:
             await query.message.reply_text('❌ Укажи разные столбцы товара и цены.')
             return
-        info = inspect_mapping(stage['data'], item['sheet'], mapping, item.get('header_row', 0))
+        info = inspect_mapping(item.get('data', stage['data']), item['sheet'], mapping, item.get('header_row', 0))
         if not info['valid'] or info['truncated']:
             await query.message.reply_text('❌ Нет строк с распознанными названиями и положительными ценами либо лист слишком велик. Исправь столбцы.')
             return
@@ -1014,14 +1019,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extracted, skipped = [], 0
             selected_items = [it for it in staged['sheets'] if it.get('enabled')]
             for selected in selected_items:
-                batch, missing = extract_xlsx(staged['data'], selected['sheet'], selected['mapping'], selected['header_row'], default_brand=_supplier_default_brand(sid))
+                batch, missing = extract_xlsx(selected.get('data', staged['data']), selected['sheet'], selected['mapping'], selected['header_row'], default_brand=_supplier_default_brand(sid))
                 extracted.extend(batch)
                 skipped += missing
             parsed = [(parse_product(name), price) for name, price in extracted]
             report = save_excel_rows(sid, parsed, staged['currency'], staged['tax_status'])
             context.user_data.pop('excel_pending', None)
             try:
-                profiles = [{**it, 'fingerprint': sheet_fingerprint(staged['data'], it['sheet'], it['header_row'], it['mapping'])} for it in selected_items]
+                profiles = [{**it, 'fingerprint': sheet_fingerprint(it.get('data', staged['data']), it['sheet'], it['header_row'], it['mapping'])} for it in selected_items]
                 save_excel_profiles(sid, profiles)
             except Exception:
                 logger.exception('Excel profiles save failed')
@@ -1030,7 +1035,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text('❌ Импорт не выполнен. Проверь Railway Logs. Повтори отправку файла.')
             return
         await query.message.reply_text(
-            f"✅ Excel сохранён!\nКонфигураций: {report['saved']}\n"
+            f"✅ Excel сохранён!\nФайлов: {len(staged.get('files', [1]))}\nКонфигураций: {report['saved']}\n"
             f"Нераспознанных строк (сохранены по исходному названию): {report['unrecognized_rows']}\n"
             f"Дубли внутри файла: {report['duplicates']}\n"
             f"Строк без цены: {skipped}\n"
@@ -1193,75 +1198,136 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await authorize(update):
-        return
-    if context.user_data.get('auto_draft'):
-        await update.effective_message.reply_text('Сначала сохрани или отмени текстовый черновик.', reply_markup=auto_draft_keyboard(context.user_data['auto_draft']))
-        return
-    if context.user_data.get('parts'):
-        await update.effective_message.reply_text('Сначала заверши или отмени сбор текстового прайса. Excel не будет импортирован во время сбора.', reply_markup=multipart_keyboard())
-        return
-    doc = update.effective_message.document
-    if not doc or not doc.file_name.lower().endswith('.xlsx'):
-        await update.effective_message.reply_text('Поддерживаются файлы .xlsx.')
-        return
-    if doc.file_size and doc.file_size > MAX_FILE_BYTES:
-        await update.effective_message.reply_text('Файл больше 12 МБ.')
-        return
-    sid = context.user_data.get('supplier_id')
-    supplier = get_supplier(sid) if sid else None
-    if not supplier:
-        await update.effective_message.reply_text('Сначала выбери поставщика через /suppliers.')
-        return
-    if supplier['currency'] not in ('USD', 'BYN', 'RUB', 'EUR') or supplier['tax_status'] not in ('with_vat', 'without_vat'):
-        await update.effective_message.reply_text('Сначала укажи валюту и НДС в /settings.')
-        return
-    try:
-        tg_file = await doc.get_file()
-        payload = bytes(await tg_file.download_as_bytearray())
-        detected = inspect_xlsx(payload, tax_status=supplier['tax_status'])
-        profiles = get_excel_profiles(sid)
-        sheets = []
-        for result in detected:
-            name = result['sheet']
-            if result['status'] == 'preview' and result.get('valid', 0) > 0 and not result.get('ambiguous') and not result.get('truncated'):
-                item = dict(result, enabled=True, skipped=False)
-            else:
-                item = {'sheet': name, 'mapping': {k: None for k in EXCEL_FIELDS},
-                        'header_row': 0, 'enabled': False, 'skipped': False}
-                old = profiles.get(name)
-                if old:
-                    oldmap, oldhead = old['mapping'], old['header_row']
-                    fingerprint = sheet_fingerprint(payload, name, oldhead, oldmap)
-                    if fingerprint == old['column_fingerprint']:
-                        check = inspect_mapping(payload, name, oldmap, oldhead)
-                        if check['valid'] and not check['truncated']:
-                            item.update(check)
-                            item.update(mapping=oldmap, header_row=oldhead, enabled=True)
-            # Reuse supplier's validated column choice if headers are unchanged.
+def _inspect_excel_file(payload, filename, tax_status, profiles):
+    """Validate one file independently; stage all its worksheets without writing offers."""
+    detected = inspect_xlsx(payload, tax_status=tax_status)
+    sheets = []
+    for result in detected:
+        name = result['sheet']
+        if result['status'] == 'preview' and result.get('valid', 0) > 0 and not result.get('ambiguous') and not result.get('truncated'):
+            item = dict(result, enabled=True, skipped=False)
+        else:
+            item = {'sheet': name, 'mapping': {k: None for k in EXCEL_FIELDS},
+                    'header_row': 0, 'enabled': False, 'skipped': False}
             old = profiles.get(name)
-            if old and not (result['status'] == 'preview' and result.get('valid', 0) > 0):
+            if old:
                 oldmap, oldhead = old['mapping'], old['header_row']
                 if sheet_fingerprint(payload, name, oldhead, oldmap) == old['column_fingerprint']:
                     check = inspect_mapping(payload, name, oldmap, oldhead)
                     if check['valid'] and not check['truncated']:
-                        item.update(check, mapping=oldmap, header_row=oldhead, enabled=True, skipped=False)
-            sheets.append(item)
-        if not sheets:
-            await update.effective_message.reply_text('В файле нет доступных листов.')
-            return
-    except Exception as exc:
-        logger.exception('Excel inspection failed')
-        await update.effective_message.reply_text('Ошибка чтения Excel: '+str(exc)[:180])
-        return
-    context.user_data['excel_pending'] = {
-        'data': payload, 'sheets': sheets, 'supplier_id': sid,
-        'supplier_name': supplier['name'], 'currency': supplier['currency'],
-        'tax_status': supplier['tax_status'], 'expires': time.time()+1800,
-    }
-    await excel_review(update.effective_message, context)
+                        item.update(check, mapping=oldmap, header_row=oldhead, enabled=True)
+        old = profiles.get(name)
+        if old and not (result['status'] == 'preview' and result.get('valid', 0) > 0):
+            oldmap, oldhead = old['mapping'], old['header_row']
+            if sheet_fingerprint(payload, name, oldhead, oldmap) == old['column_fingerprint']:
+                check = inspect_mapping(payload, name, oldmap, oldhead)
+                if check['valid'] and not check['truncated']:
+                    item.update(check, mapping=oldmap, header_row=oldhead, enabled=True, skipped=False)
+        item.update(file_name=filename, data=payload)
+        sheets.append(item)
+    if not sheets:
+        raise ValueError(f'В файле {filename} нет доступных листов')
+    return sheets
 
+
+async def _finalize_excel_batch(context, message, album_key=None):
+    """One common review for a Telegram media group (or one standalone file)."""
+    draft = context.user_data.get('excel_album')
+    if not draft or (album_key is not None and draft['key'] != album_key):
+        return
+    context.user_data.pop('excel_album', None)
+    sid = draft['supplier_id']
+    supplier = get_supplier(sid)
+    if not supplier or supplier['currency'] != draft['currency'] or supplier['tax_status'] != draft['tax_status']:
+        await message.reply_text('Настройки поставщика изменились. Повтори загрузку файлов.')
+        return
+    if draft['errors']:
+        await message.reply_text('❌ Общий Excel-прайс не принят. Старые товары сохранены.\n' + '\n'.join(draft['errors'])[:3000])
+        return
+    if not draft['files']:
+        await message.reply_text('Не получено корректных Excel-файлов.')
+        return
+    sheets = [item for file in draft['files'] for item in file['sheets']]
+    context.user_data['excel_pending'] = {
+        'data': draft['files'][0]['data'], 'files': draft['files'],
+        'sheets': sheets, 'supplier_id': sid, 'supplier_name': supplier['name'],
+        'currency': supplier['currency'], 'tax_status': supplier['tax_status'],
+        'expires': time.time()+1800,
+    }
+    await excel_review(message, context)
+
+
+async def _finish_excel_album(context, message, key):
+    """Telegram does not report the album length; debounce incoming updates."""
+    while True:
+        draft = context.user_data.get('excel_album')
+        if not draft or draft['key'] != key:
+            return
+        version = draft['version']
+        await asyncio.sleep(2.5)
+        draft = context.user_data.get('excel_album')
+        if not draft or draft['key'] != key:
+            return
+        if draft['version'] == version:
+            await _finalize_excel_batch(context, message, key)
+            return
+
+
+async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await authorize(update):
+        return
+    message = update.effective_message
+    if context.user_data.get('auto_draft'):
+        await message.reply_text('Сначала сохрани или отмени текстовый черновик.', reply_markup=auto_draft_keyboard(context.user_data['auto_draft']))
+        return
+    if context.user_data.get('parts'):
+        await message.reply_text('Сначала заверши или отмени сбор текстового прайса.', reply_markup=multipart_keyboard())
+        return
+    sid = context.user_data.get('supplier_id')
+    supplier = get_supplier(sid) if sid else None
+    if not supplier:
+        await message.reply_text('Сначала выбери поставщика через /suppliers.')
+        return
+    if supplier['currency'] not in ('USD', 'BYN', 'RUB', 'EUR') or supplier['tax_status'] not in ('with_vat', 'without_vat'):
+        await message.reply_text('Сначала укажи валюту и НДС в /settings.')
+        return
+    album_id = message.media_group_id
+    key = f'{message.chat_id}:{album_id}' if album_id else None
+    draft = context.user_data.get('excel_album')
+    if draft and draft['key'] != key:
+        # Never interleave separate uploads or suppliers.
+        await message.reply_text('Сначала закончи текущую загрузку Excel, затем отправь следующую.')
+        return
+    if not draft:
+        # Invalidate an older confirmation when a new upload begins.
+        context.user_data.pop('excel_pending', None)
+        draft = {'key': key, 'supplier_id': sid, 'currency': supplier['currency'],
+                 'tax_status': supplier['tax_status'], 'files': [], 'errors': [],
+                 'version': 0, 'seen': set()}
+        context.user_data['excel_album'] = draft
+    doc = message.document
+    draft['version'] += 1
+    if doc and doc.file_unique_id not in draft['seen']:
+        draft['seen'].add(doc.file_unique_id)
+        if not doc.file_name or not doc.file_name.lower().endswith('.xlsx'):
+            draft['errors'].append(f'{doc.file_name or "Без имени"}: нужен файл .xlsx')
+        elif doc.file_size and doc.file_size > MAX_FILE_BYTES:
+            draft['errors'].append(f'{doc.file_name}: превышен лимит размера файла')
+        else:
+            try:
+                tg_file = await doc.get_file()
+                payload = bytes(await tg_file.download_as_bytearray())
+                profiles = get_excel_profiles(sid)
+                sheets = _inspect_excel_file(payload, doc.file_name, supplier['tax_status'], profiles)
+                draft['files'].append({'name': doc.file_name, 'data': payload, 'sheets': sheets})
+            except Exception as exc:
+                logger.exception('Excel inspection failed: %s', doc.file_name)
+                draft['errors'].append(f'{doc.file_name}: {str(exc)[:140]}')
+    if album_id:
+        if draft['version'] == 1:
+            context.application.create_task(_finish_excel_album(context, message, key), update=update)
+    else:
+        await _finalize_excel_batch(context, message)
 
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1556,58 +1622,16 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Telegram error: %s", context.error, exc_info=context.error)
 
 
-
-async def mts_update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only manual MTS refresh; runs outside Telegram event loop."""
-    if not is_owner(update):
-        await update.effective_message.reply_text('🔒 Запуск парсера доступен только владельцу.')
-        return
-    import asyncio
-    if os.getenv('MTS_MANUAL_ENABLED', '0').strip() != '1':
-        await update.effective_message.reply_text('Ручной сбор выключен (MTS_MANUAL_ENABLED=0).')
-        return
-    state = context.application.bot_data.setdefault('mts_manual_state', {'running': False})
-    if state['running']:
-        await update.effective_message.reply_text('⏳ Сбор МТС уже запущен через Telegram.')
-        return
-    state['running'] = True
-    chat_id = update.effective_chat.id
-    await update.effective_message.reply_text('🔄 Запускаю сбор МТС: смартфоны, планшеты, часы, наушники, ноутбуки. Результат пришлю сюда.')
-    async def perform():
-        try:
-            from web_worker import CATEGORIES, run
-            result = await asyncio.to_thread(run, CATEGORIES, int(os.getenv('MTS_MAX_PAGES', '50')))
-            descriptions = {
-                0: '✅ Сбор МТС завершён; результаты сохранены в web_offers.',
-                2: '⚠️ Сбор завершился с ошибками. Проверь Deploy Logs; часть категорий могла сохраниться.',
-                3: '⏳ Другой сбор МТС уже выполняется. Новый не запущен.',
-            }
-            await context.bot.send_message(chat_id, descriptions.get(result, f'MTS: код завершения {result}'))
-        except Exception:
-            logger.exception('Manual MTS crawl failed')
-            await context.bot.send_message(chat_id, '❌ Сбор МТС завершился ошибкой. Проверь Deploy Logs.')
-        finally:
-            state['running'] = False
-    context.application.create_task(perform(), name='mts_manual_update')
-
-async def combined_post_init(application):
-    """Start both independent scrapers without changing existing MTS scheduling."""
-    await mts_post_init(application)
-    await a1_bot_integration.post_init(application)
-
-
 def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
-    app = ApplicationBuilder().token(token).post_init(combined_post_init).build()
+    app = ApplicationBuilder().token(token).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CommandHandler('cancelrate', cancelrate))
-    app.add_handler(CommandHandler('mtsupdate', mts_update_command))
-    a1_bot_integration.register(app)
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
