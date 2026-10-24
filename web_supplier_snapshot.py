@@ -32,15 +32,19 @@ def prepare_snapshot(by_category):
                 or p.hostname != 'shop.mts.by' or not price.is_finite() or price <= 0
                 or item.currency != 'BYN'):
                 raise ValueError(f'Invalid MTS catalogue offer {category}/{sku}')
-            if sku in prepared:
-                raise ValueError(f'Duplicate MTS SKU in categories: {sku}')
+            # Site analytics SKUs can repeat for different URLs.
+            # Use a stable product URL identity across all categories.
+            key = hashlib.sha256(url.encode('utf-8')).hexdigest()
+            if key in prepared:
+                old_url = prepared[key][3]
+                raise ValueError(f'Duplicate MTS URL across categories: {old_url}')
             parsed = parse_product(name)
-            signature = hashlib.sha256(('mts:' + sku).encode('utf-8')).hexdigest()
+            signature = hashlib.sha256(('mts:' + url).encode('utf-8')).hexdigest()
             warnings = list(parsed.get('warnings') or [])
             warnings.append('Публичная цена каталога МТС; условия закупки для юрлица не подтверждены')
             if getattr(item, 'approximate', False):
                 warnings.append('Цена на сайте указана с пометкой «от»')
-            prepared[sku] = (signature, sku, name, url, parsed, price, warnings)
+            prepared[key] = (signature, sku, name, url, parsed, price, warnings)
             per_category[category] += 1
     return prepared, per_category
 
