@@ -18,6 +18,7 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 from mts_daily_scheduler import post_init as mts_post_init
+import a1_bot_integration
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
@@ -1589,17 +1590,24 @@ async def mts_update_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             state['running'] = False
     context.application.create_task(perform(), name='mts_manual_update')
 
+async def combined_post_init(application):
+    """Start both independent scrapers without changing existing MTS scheduling."""
+    await mts_post_init(application)
+    await a1_bot_integration.post_init(application)
+
+
 def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
-    app = ApplicationBuilder().token(token).post_init(mts_post_init).build()
+    app = ApplicationBuilder().token(token).post_init(combined_post_init).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CommandHandler('cancelrate', cancelrate))
     app.add_handler(CommandHandler('mtsupdate', mts_update_command))
+    a1_bot_integration.register(app)
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
