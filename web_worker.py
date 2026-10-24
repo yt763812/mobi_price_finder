@@ -52,6 +52,7 @@ def run(categories, max_pages=50, report=None):
             with psycopg.connect(dsn, connect_timeout=10) as conn:
                 init(conn)
                 failed = False
+                snapshots = {}
                 for category in categories:
                     if category not in shop.categories:
                         emit(f'MTS/{category}: категория не настроена')
@@ -71,13 +72,33 @@ def run(categories, max_pages=50, report=None):
                         products = [StoredOffer('mts', category, p.sku, p.name, p.url,
                                                 p.price, p.currency, p.availability)
                                     for p in result.products]
-                        save_observations(conn, 'mts', category, products)
-                        emit(f'SAVED mts/{category}: {len(products)} catalogue prices (public, not B2B verified)')
+                        snapshots[category] = result.products
+                        emit(f'VALIDATED mts/{category}: {len(products)} catalogue prices')
                     except Exception:
                         traceback.print_exc()
                         emit(f'FAILED mts/{category}: previous observations preserved')
                         failed = True
-                return 2 if failed else 0
+                if failed:
+                    emit('NOT SAVED: failed/incomplete category; supplier snapshot untouched')
+                    return 2
+                # A single category test is intentionally NOT a supplier replacement.
+                if set(categories) != set(CATEGORIES):
+                    emit('NOT SAVED: supplier refresh requires all five categories')
+                    return 2
+                from web_supplier_snapshot import replace_shop_supplier
+                summary = replace_shop_supplier(snapshots)
+                emit(f'SAVED supplier shop.mts.by: {summary["saved"]} offers, id={summary["supplier_id"]}')
+                # Existing web history is secondary; failure must not roll back supplier snapshot.
+                for category in categories:
+                    try:
+                        products = [StoredOffer('mts', category, p.sku, p.name, p.url,
+                                                p.price, p.currency, p.availability)
+                                    for p in snapshots[category]]
+                        save_observations(conn, 'mts', category, products)
+                    except Exception:
+                        traceback.print_exc()
+                        emit(f'WARN mts/{category}: secondary web history not updated')
+                return 0
         finally:
             lock_conn.execute('SELECT pg_advisory_unlock(%s)', (LOCK_KEY,))
 
