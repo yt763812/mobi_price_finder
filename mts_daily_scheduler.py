@@ -1,6 +1,6 @@
 """Daily MTS updater attached to the existing Telegram bot.
 
-Disabled unless MTS_DAILY_ENABLED=1. Schedule: 07:00 Europe/Minsk,
+Disabled unless MTS_DAILY_ENABLED=1. Schedule: 07:00 and 15:00 Europe/Minsk,
 with catch-up after restart. Once per Minsk calendar day across replicas.
 """
 import asyncio
@@ -11,73 +11,77 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 MINSK = ZoneInfo('Europe/Minsk')
-DDL = '''CREATE TABLE IF NOT EXISTS mts_daily_runs (
-  local_day DATE PRIMARY KEY,
+DDL = '''CREATE TABLE IF NOT EXISTS mts_twice_daily_runs (
+  local_day DATE NOT NULL,
+  run_slot TEXT NOT NULL,
   status TEXT NOT NULL,
   started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   finished_at TIMESTAMPTZ,
-  detail TEXT
+  detail TEXT,
+  PRIMARY KEY(local_day,run_slot)
 )'''
+SLOTS = (("morning", time(7, 0)), ("afternoon", time(15, 0)))
 
 
-def due_day(now=None):
-    """Return Minsk date after 07:00, otherwise None."""
+def due_slot(now=None):
     local = (now or datetime.now(MINSK)).astimezone(MINSK)
-    return local.date() if local.time() >= time(7, 0) else None
+    for slot, starts in reversed(SLOTS):
+        scheduled = datetime.combine(local.date(), starts, MINSK)
+        seconds = (local - scheduled).total_seconds()
+        if 0 <= seconds <= int(os.getenv('MTS_SCHEDULE_GRACE_MINUTES', '90')) * 60:
+            return local.date(), slot
+    return None
 
 
-def claim_day(day):
-    """Atomically allow only one bot instance to run on each calendar date."""
-    import psycopg
-    dsn = os.environ['DATABASE_URL']
-    with psycopg.connect(dsn, connect_timeout=10) as conn:
-        with conn.cursor() as cur:
-            cur.execute(DDL)
-            cur.execute('''INSERT INTO mts_daily_runs(local_day,status)
-                VALUES (%s,'running') ON CONFLICT (local_day) DO NOTHING
-                RETURNING local_day''', (day,))
-            return cur.fetchone() is not None
-
-
-def finish_day(day, success, detail):
+def claim_slot(day, slot):
     import psycopg
     with psycopg.connect(os.environ['DATABASE_URL'], connect_timeout=10) as conn:
         with conn.cursor() as cur:
-            cur.execute('''UPDATE mts_daily_runs SET status=%s, finished_at=now(), detail=%s
-                           WHERE local_day=%s''',
-                        ('success' if success else 'failed', str(detail)[:2000], day))
+            cur.execute(DDL)
+            cur.execute('''INSERT INTO mts_twice_daily_runs(local_day,run_slot,status)
+                VALUES (%s,%s,'running') ON CONFLICT (local_day,run_slot) DO NOTHING
+                RETURNING local_day''', (day, slot))
+            return cur.fetchone() is not None
 
 
-def run_worker(day):
-    """Blocking HTTP + SQL runs in worker thread, never in Telegram event loop."""
-    from web_worker import run
-    categories = ['smartphones', 'tablets', 'watches', 'headphones', 'laptops']
+def finish_slot(day, slot, success, detail):
+    import psycopg
+    with psycopg.connect(os.environ['DATABASE_URL'], connect_timeout=10) as conn:
+        conn.execute('''UPDATE mts_twice_daily_runs
+            SET status=%s,finished_at=now(),detail=%s
+            WHERE local_day=%s AND run_slot=%s''',
+            ('success' if success else 'failed', str(detail)[:2000], day, slot))
+
+
+def run_worker(day, slot):
+    from web_worker import run, CATEGORIES
     result = 1
     try:
-        result = run(categories, int(os.getenv('MTS_MAX_PAGES', '50')))
+        result = run(list(CATEGORIES), int(os.getenv('MTS_MAX_PAGES', '100')))
         return result
     finally:
-        # If container stops mid-crawl the row remains 'running': no duplicate run.
         try:
-            finish_day(day, result == 0, f'exit_code={result}')
+            finish_slot(day, slot, result == 0, f'exit_code={result}')
         except Exception:
-            logger.exception('Failed to record MTS daily result')
+            logger.exception('Failed to record MTS scheduled result')
 
 
 async def schedule_loop():
-    logger.info('MTS daily scheduler enabled: 07:00 Europe/Minsk')
+    logger.info('MTS scheduler enabled: 07:00 and 15:00 Europe/Minsk')
     while True:
         try:
-            day = due_day()
-            if day and await asyncio.to_thread(claim_day, day):
-                logger.info('MTS scheduled crawl started: %s', day)
-                result = await asyncio.to_thread(run_worker, day)
-                logger.info('MTS scheduled crawl finished: exit=%s', result)
+            due = due_slot()
+            if due:
+                day, slot = due
+                if await asyncio.to_thread(claim_slot, day, slot):
+                    logger.info('MTS scheduled crawl started: %s %s', day, slot)
+                    result = await asyncio.to_thread(run_worker, day, slot)
+                    logger.info('MTS scheduled crawl finished: exit=%s', result)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception('MTS scheduler error; Telegram bot continues running')
-        await asyncio.sleep(300)
+            logger.exception('MTS scheduler error; bot continues running')
+        await asyncio.sleep(30)
 
 
 async def post_init(application):
