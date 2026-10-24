@@ -18,6 +18,7 @@ from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
 )
+from myfin_rate import MYFIN_URL, fetch_bsb_usd_sale
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
@@ -841,17 +842,35 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"✅ Режим: {labels[mode_name]}")
     elif action == 'fx:menu':
         rate = get_usd_byn_rate()
-        buttons = [[InlineKeyboardButton('✏️ Изменить курс USD/BYN', callback_data='fx:edit')]] if is_owner(update) else []
+        buttons = [
+            [InlineKeyboardButton('✏️ Установить курс вручную', callback_data='fx:edit')],
+            [InlineKeyboardButton('🏦 Получить курс БСБ Банка (Myfin)', callback_data='fx:myfin')],
+        ]
         await query.message.reply_text(
-            f'💱 Курс сравнения: 1 USD = {rate} BYN\n'
-            'Курс используется для сортировки BYN и USD; цены поставщиков не изменяются.',
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+            f'💱 Текущий курс: 1 USD = {rate} BYN\n'
+            'Источник для загрузки: Myfin, БСБ Банк, продажа USD.\n'
+            'Курс меняется только по нажатию кнопки; исходные цены товаров не меняются.',
+            reply_markup=InlineKeyboardMarkup(buttons))
     elif action == 'fx:edit':
-        if not is_owner(update):
-            await query.message.reply_text('Изменять курс может только владелец.')
-            return
         context.user_data['await_fx_rate'] = True
         await query.message.reply_text('Введи новый курс: сколько BYN за 1 USD, например 3,05. /cancelrate — отмена.')
+    elif action == 'fx:myfin':
+        # Fetch the website off the event loop: do not stall the Telegram bot.
+        await query.message.reply_text('🏦 Получаю курс продажи USD БСБ Банка с Myfin...')
+        try:
+            rate = await asyncio.to_thread(fetch_bsb_usd_sale)
+            # Only write after the bank has been identified and validated.
+            saved = await asyncio.to_thread(set_usd_byn_rate, rate)
+        except Exception:
+            logger.exception('Failed to update USD/BYN from Myfin')
+            await query.message.reply_text(
+                '⚠️ Не удалось получить и проверить курс БСБ Банка. '
+                'Прежний курс сохранён. Попробуй позднее или установи вручную.')
+            return
+        await query.message.reply_text(
+            f'✅ Курс обновлён: 1 USD = {saved} BYN\n'
+            '🏦 БСБ Банк — продажа USD\n'
+            f'Источник: {MYFIN_URL}')
     elif action == 'nav:suppliers':
         await query.message.reply_text('Выбери поставщика:', reply_markup=keyboard_suppliers())
     elif action == 'nav:settings':
@@ -1091,9 +1110,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ {supplier['name']}: 🚚 {_delivery_label(days)}", reply_markup=settings_keyboard(supplier))
         return
     if context.user_data.get('await_fx_rate'):
-        if not is_owner(update):
-            context.user_data.pop('await_fx_rate', None)
-            return
         if text.lower() in ('/cancelrate', 'отмена'):
             context.user_data.pop('await_fx_rate', None)
             await update.effective_message.reply_text('Изменение курса отменено.')
