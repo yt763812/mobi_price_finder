@@ -12,6 +12,7 @@ from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 import json
 import time
+import threading
 import urllib.request
 
 USER_AGENT = 'MobiPriceFinder/0.1 (public catalog; contact: configure-before-use)'
@@ -117,6 +118,7 @@ class PublicFetcher:
         self.delay = max(1.0, delay)
         self.agent = user_agent
         self.last_request = 0.0
+        self._request_lock = threading.Lock()
         self.robot = RobotFileParser()
         self.robot.set_url(f'https://{domain}/robots.txt')
         # Fail closed when robots cannot be fetched.
@@ -129,11 +131,13 @@ class PublicFetcher:
             raise ValueError('URL outside allowed domain')
         if not self.robot.can_fetch(self.agent, url):
             raise PermissionError(f'robots.txt disallows {url}')
-        wait = self.delay - (time.monotonic() - self.last_request)
-        if wait > 0:
-            time.sleep(wait)
+        # Keep a minimum spacing between request STARTS across all threads.
+        with self._request_lock:
+            wait = self.delay - (time.monotonic() - self.last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self.last_request = time.monotonic()
         request = urllib.request.Request(url, headers={'User-Agent': self.agent, 'Accept': 'text/html'})
-        self.last_request = time.monotonic()
         with urllib.request.urlopen(request, timeout=20) as response:
             content_type = response.headers.get('Content-Type', '')
             if 'text/html' not in content_type:
