@@ -51,7 +51,7 @@ def finish_day(day, success, detail):
 def run_worker(day):
     """Blocking HTTP + SQL runs in worker thread, never in Telegram event loop."""
     from web_worker import run
-    categories = ['smartphones', 'tablets', 'watches', 'headphones']
+    categories = ['smartphones', 'tablets', 'watches', 'headphones', 'laptops']
     result = 1
     try:
         result = run(categories, int(os.getenv('MTS_MAX_PAGES', '50')))
