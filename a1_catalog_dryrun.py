@@ -109,58 +109,124 @@ def expected_count(parser):
 def page_url(path,page):
     return BASE+path+(('?'+urlencode({'page':page})) if page>1 else '')
 
+def _page_choices(raw):
+    parsed = PageParser()
+    parsed.feed(raw)
+    choices = {}
+    for anchor in parsed.anchors:
+        url = canonical_url(anchor['href'])
+        if not url:
+            continue
+        text = anchor['text']
+        if url not in choices or len(text) > len(choices[url]):
+            choices[url] = text
+    return parsed, choices
+
+
 def crawl(section, max_pages, timeout, pause):
-    path=SECTIONS[section]; items={}; seen_page_keys=set()
-    issues=[]; warnings=[]; pages=0; expected=None; next_seen=False; limit_hit=False
-    for page in range(1,max_pages+1):
-        url=page_url(path,page)
-        raw=fetch(url,timeout)
-        parsed=PageParser(); parsed.feed(raw)
-        count=expected_count(parsed)
-        if page==1: expected=count
-        choices={}
-        for a in parsed.anchors:
-            canonical=canonical_url(a['href'])
-            if not canonical: continue
-            current=choices.get(canonical)
-            if current is None or len(a['text'])>len(current): choices[canonical]=a['text']
+    """Crawl A1 with per-page reconciliation. Never fill missing slots from stale runs.
+
+    Some middle pages intermittently contain 17-19 products instead of 20.
+    Re-fetch suspicious pages, then keep the best current response. A
+    persistent shortfall still blocks database updates in prepare_snapshot().
+    """
+    path = SECTIONS[section]
+    items = {}
+    seen_page_keys = set()
+    issues, warnings = [], []
+    pages = 0
+    expected = None
+    limit_hit = False
+    page_retries = 0
+    for page in range(1, max_pages + 1):
+        url = page_url(path, page)
+        parsed, choices = _page_choices(fetch(url, timeout))
+        if page == 1:
+            expected = expected_count(parsed)
+        next_link = lambda doc: any(
+            'page=' + str(page + 1) in a['href'] and '/catalog/' in a['href']
+            for a in doc.anchors
+        )
+        has_next = next_link(parsed)
+        overlap = len(set(choices) & set(items))
+        # Middle pages normally have 20 distinct products. A shorter page
+        # or cross-page overlap can result from an in-flight catalogue update.
+        # Retry this page and retain the best (largest, least-overlapping)
+        # single response; never merge partial/stale page responses.
+        suspicious = has_next and (len(choices) < 20 or overlap > 0)
+        if suspicious:
+            best = (parsed, choices, has_next)
+            def quality(candidate):
+                _, links, _ = candidate
+                return (len(set(links) - set(items)), len(links))
+            for attempt in range(3):
+                time.sleep(max(pause, 0.3))
+                try:
+                    alternative_parsed, alternative_choices = _page_choices(fetch(url, timeout))
+                except Exception as exc:
+                    warnings.append(f'Page {page} reread {attempt + 1} failed: {type(exc).__name__}')
+                    continue
+                page_retries += 1
+                candidate = (alternative_parsed, alternative_choices, next_link(alternative_parsed))
+                if quality(candidate) > quality(best):
+                    best = candidate
+                if len(set(best[1]) - set(items)) >= 20:
+                    break
+            parsed, choices, has_next = best
+            if len(choices) < 20 or len(set(choices) & set(items)) > 0:
+                warnings.append(
+                    f'Page {page}: {len(choices)} products, '
+                    f'{len(set(choices) & set(items))} overlaps after rereads'
+                )
         if not choices:
-            if page==1: issues.append('No product links on first page: '+url)
+            if page == 1:
+                issues.append('No product links on first page: ' + url)
             break
-        fingerprint=frozenset(choices)
+        fingerprint = frozenset(choices)
         if fingerprint in seen_page_keys:
-            print(f'A1 {section}: repeated page {page}; ending at {pages}',flush=True)
+            print(f'A1 {section}: repeated page {page}; ending at {pages}', flush=True)
             break
         seen_page_keys.add(fingerprint)
-        pages+=1
-        additions=0
-        for product_url,txt in choices.items():
-            price,amounts,flags=parse_advertised_price(txt)
+        pages += 1
+        for product_url, txt in choices.items():
+            price, amounts, flags = parse_advertised_price(txt)
+            normalized_price = str(price) if price is not None else None
             if product_url not in items:
-                items[product_url]={'url':product_url,'text':txt,'price_byn':str(price) if price is not None else None,
-                    'full_price_candidates':[str(p) for p in amounts], 'flags':flags.split(',') if flags else [],'section':section}
-                additions+=1
-            elif items[product_url]['price_byn']!= (str(price) if price is not None else None):
-                issues.append('Conflicting price for '+product_url)
-        has_next=any('page='+str(page+1) in a['href'] and '/catalog/' in a['href'] for a in parsed.anchors)
-        print(f'A1 {section}: pages={pages} unique={len(items)} priced={sum(x["price_byn"] is not None for x in items.values())} next={has_next}',flush=True)
-        if has_next: next_seen=True
+                items[product_url] = {
+                    'url': product_url, 'text': txt, 'price_byn': normalized_price,
+                    'full_price_candidates': [str(p) for p in amounts],
+                    'flags': flags.split(',') if flags else [], 'section': section,
+                }
+            elif items[product_url]['price_byn'] != normalized_price:
+                issues.append('Conflicting price for ' + product_url)
+        print(
+            f'A1 {section}: pages={pages} unique={len(items)} '
+            f'priced={sum(x["price_byn"] is not None for x in items.values())} '
+            f'next={has_next}', flush=True
+        )
         if not has_next:
-            # All 20-item pages must have their next page probed even if pagination disappears.
-            if len(choices)<20: break
+            if len(choices) < 20:
+                break
             warnings.append(f'Page {page} full but no next link; probing next page')
-        if page==max_pages:
-            limit_hit=has_next or len(choices)==20
+        if page == max_pages:
+            limit_hit = has_next or len(choices) == 20
             break
         time.sleep(pause)
-    if expected is not None and len(items)<expected:
+    if expected is not None and len(items) < expected:
         warnings.append(f'JSON-LD advertises {expected} items; found {len(items)} distinct links')
-    if limit_hit: issues.append('max-pages limit reached; result potentially incomplete')
-    if pages==0: issues.append('No pages successfully parsed')
-    missing=sum(x['price_byn'] is None for x in items.values())
-    if missing: warnings.append(f'{missing} products have no recognized full-price amount')
-    return {'section':section,'pages':pages,'expected_items':expected,'found':len(items),
-            'priced':len(items)-missing,'issues':issues,'warnings':warnings,'products':list(items.values())}
+    if limit_hit:
+        issues.append('max-pages limit reached; result potentially incomplete')
+    if pages == 0:
+        issues.append('No pages successfully parsed')
+    missing = sum(x['price_byn'] is None for x in items.values())
+    if missing:
+        warnings.append(f'{missing} products have no recognized full-price amount')
+    return {
+        'section': section, 'pages': pages, 'expected_items': expected,
+        'found': len(items), 'priced': len(items) - missing,
+        'page_retries': page_retries,
+        'issues': issues, 'warnings': warnings, 'products': list(items.values()),
+    }
 
 def main():
     ap=argparse.ArgumentParser(description='Read-only A1 catalogue extraction. NO DATABASE WRITES.')
