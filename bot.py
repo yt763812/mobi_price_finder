@@ -1555,6 +1555,40 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Telegram error: %s", context.error, exc_info=context.error)
 
 
+
+async def mts_update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only manual MTS refresh; runs outside Telegram event loop."""
+    if not is_owner(update):
+        await update.effective_message.reply_text('🔒 Запуск парсера доступен только владельцу.')
+        return
+    import asyncio
+    if os.getenv('MTS_MANUAL_ENABLED', '0').strip() != '1':
+        await update.effective_message.reply_text('Ручной сбор выключен (MTS_MANUAL_ENABLED=0).')
+        return
+    state = context.application.bot_data.setdefault('mts_manual_state', {'running': False})
+    if state['running']:
+        await update.effective_message.reply_text('⏳ Сбор МТС уже запущен через Telegram.')
+        return
+    state['running'] = True
+    chat_id = update.effective_chat.id
+    await update.effective_message.reply_text('🔄 Запускаю сбор МТС: смартфоны, планшеты, часы, наушники, ноутбуки. Результат пришлю сюда.')
+    async def perform():
+        try:
+            from web_worker import CATEGORIES, run
+            result = await asyncio.to_thread(run, CATEGORIES, int(os.getenv('MTS_MAX_PAGES', '50')))
+            descriptions = {
+                0: '✅ Сбор МТС завершён; результаты сохранены в web_offers.',
+                2: '⚠️ Сбор завершился с ошибками. Проверь Deploy Logs; часть категорий могла сохраниться.',
+                3: '⏳ Другой сбор МТС уже выполняется. Новый не запущен.',
+            }
+            await context.bot.send_message(chat_id, descriptions.get(result, f'MTS: код завершения {result}'))
+        except Exception:
+            logger.exception('Manual MTS crawl failed')
+            await context.bot.send_message(chat_id, '❌ Сбор МТС завершился ошибкой. Проверь Deploy Logs.')
+        finally:
+            state['running'] = False
+    context.application.create_task(perform(), name='mts_manual_update')
+
 def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
@@ -1565,6 +1599,7 @@ def main():
                              ('find', find), ('menu', menu), ('mode', mode)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CommandHandler('cancelrate', cancelrate))
+    app.add_handler(CommandHandler('mtsupdate', mts_update_command))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
