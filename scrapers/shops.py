@@ -17,6 +17,7 @@ SHOPS = {
     'mts': Shop('mts', 'shop.mts.by', {
         'smartphones': 'https://shop.mts.by/phones/',
         'tablets': 'https://shop.mts.by/tabletpc/tablet/',
+        'laptops': 'https://shop.mts.by/tabletpc/laptops/',
         'watches': 'https://shop.mts.by/gadgets/smart-watch/',
         'headphones': 'https://shop.mts.by/gadgets/headphones/',
     }),
