@@ -1,4 +1,4 @@
-"""Owner-only A1 manual refresh and 07:00 Minsk scheduler. Does not modify MTS."""
+"""Owner-only A1 manual refresh and 07:20 and 15:20 Minsk scheduler. Does not modify MTS."""
 import asyncio
 import logging
 import os
@@ -81,46 +81,65 @@ async def manual_command(update, context):
     context.application.create_task(perform(),name='a1_manual_update')
 
 
-def claim_day(day):
+SLOTS = (("morning", time(7, 20)), ("afternoon", time(15, 20)))
+
+
+def due_slot(now=None):
+    local = (now or datetime.now(MINSK)).astimezone(MINSK)
+    for slot, starts in reversed(SLOTS):
+        scheduled = datetime.combine(local.date(), starts, MINSK)
+        seconds = (local - scheduled).total_seconds()
+        if 0 <= seconds <= int(os.getenv('A1_SCHEDULE_GRACE_MINUTES', '90')) * 60:
+            return local.date(), slot
+    return None
+
+
+def claim_slot(day, slot):
     import psycopg
-    with psycopg.connect(os.environ['DATABASE_URL'],connect_timeout=10) as conn:
+    with psycopg.connect(os.environ['DATABASE_URL'], connect_timeout=10) as conn:
         with conn.cursor() as cur:
-            cur.execute('''CREATE TABLE IF NOT EXISTS a1_daily_runs (
-                local_day DATE PRIMARY KEY, status TEXT NOT NULL,
-                started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
-                detail TEXT)''')
-            cur.execute('''INSERT INTO a1_daily_runs(local_day,status) VALUES (%s,'running')
-                ON CONFLICT (local_day) DO NOTHING RETURNING local_day''',(day,))
+            cur.execute('''CREATE TABLE IF NOT EXISTS a1_twice_daily_runs (
+                local_day DATE NOT NULL, run_slot TEXT NOT NULL,
+                status TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                finished_at TIMESTAMPTZ, detail TEXT,
+                PRIMARY KEY(local_day,run_slot))''')
+            cur.execute('''INSERT INTO a1_twice_daily_runs(local_day,run_slot,status)
+                VALUES (%s,%s,'running') ON CONFLICT (local_day,run_slot) DO NOTHING
+                RETURNING local_day''', (day,slot))
             return cur.fetchone() is not None
 
 
-def finish_day(day,code,detail):
+def finish_slot(day,slot,code,detail):
     import psycopg
     with psycopg.connect(os.environ['DATABASE_URL'],connect_timeout=10) as conn:
-        conn.execute('UPDATE a1_daily_runs SET status=%s,finished_at=now(),detail=%s WHERE local_day=%s',
-                     ('success' if code==0 else 'failed',detail[:2000],day))
+        conn.execute('''UPDATE a1_twice_daily_runs SET status=%s,finished_at=now(),detail=%s
+            WHERE local_day=%s AND run_slot=%s''',
+            ('success' if code==0 else 'failed',detail[:2000],day,slot))
 
 
 async def daily_loop():
+    log.info('A1 scheduler enabled: 07:20 and 15:20 Europe/Minsk')
     while True:
         try:
-            local=datetime.now(MINSK)
-            if local.time()>=time(7,0) and await asyncio.to_thread(claim_day,local.date()):
-                code,detail=await asyncio.to_thread(collect_and_save)
-                await asyncio.to_thread(finish_day,local.date(),code,detail)
-                log.info('A1 daily result: %s',detail)
+            due=due_slot()
+            if due:
+                day,slot=due
+                if await asyncio.to_thread(claim_slot,day,slot):
+                    code,detail=await asyncio.to_thread(collect_and_save)
+                    await asyncio.to_thread(finish_slot,day,slot,code,detail)
+                    log.info('A1 scheduled %s result: %s',slot,detail)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception('A1 daily scheduler failure')
-        await asyncio.sleep(300)
+            log.exception('A1 scheduler failure')
+        await asyncio.sleep(30)
 
 
 async def post_init(application):
     if os.getenv('A1_DAILY_ENABLED','0')=='1':
-        application.create_task(daily_loop(),name='a1_daily_scheduler')
+        application.create_task(daily_loop(),name='a1_twice_daily_scheduler')
     else:
-        log.info('A1 daily scraper disabled')
+        log.info('A1 scheduled scraper disabled')
 
 
 def register(application):
