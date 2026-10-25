@@ -160,6 +160,69 @@ def _page_choices(raw):
     return parsed, choices
 
 
+def reconcile_missing(section, path, items, pages, expected, timeout, pause, issues, warnings):
+    """Bounded second sweep to recover product links displaced by live pagination.
+
+    Revisit the entire previously traversed category: missing links can shift
+    across more than just the page on which an overlap was observed. Do not
+    accept inconsistent prices, invented products or stale saved DB records.
+    """
+    if expected is None or len(items) >= expected or pages < 2:
+        return 0
+    print(f'A1 {section}: RECONCILE expected={expected} found={len(items)} '
+          f'missing={expected-len(items)} sweep_pages=1..{pages}', flush=True)
+    recovered = 0
+    price_conflicts = set()
+    failed_pages = []
+    for page in range(1, pages + 1):
+        url = page_url(path, page)
+        print(f'A1 {section}: reconcile page={page}/{pages} found={len(items)}', flush=True)
+        try:
+            _, choices = _page_choices(fetch(url, timeout))
+        except Exception as exc:
+            failed_pages.append(page)
+            warnings.append(f'Reconcile page {page} fetch failed: {type(exc).__name__}: {exc}')
+            time.sleep(max(pause, 0))
+            continue
+        if not choices:
+            failed_pages.append(page)
+            warnings.append(f'Reconcile page {page} has no product links')
+        for product_url, txt in choices.items():
+            price, amounts, flags = parse_advertised_price(txt)
+            value = str(price) if price is not None else None
+            if product_url in items:
+                # Only contradictory *known* prices are a hard conflict.
+                old_value = items[product_url]['price_byn']
+                if old_value is not None and value is not None and old_value != value:
+                    price_conflicts.add(product_url)
+                # A second observation with a recognized public full price
+                # can fill an originally unpriced listing.
+                if old_value is None and value is not None:
+                    items[product_url].update(text=txt, price_byn=value,
+                        full_price_candidates=[str(v) for v in amounts],
+                        flags=flags.split(',') if flags else [])
+                continue
+            items[product_url] = {
+                'url': product_url, 'text': txt, 'price_byn': value,
+                'full_price_candidates': [str(v) for v in amounts],
+                'flags': flags.split(',') if flags else [], 'section': section,
+            }
+            recovered += 1
+            print(f'A1 {section}: RECOVERED {len(items)}/{expected} {product_url}', flush=True)
+        if page < pages:
+            time.sleep(max(pause, 0))
+    if failed_pages:
+        issues.append('Reconciliation pages failed: ' + ', '.join(map(str, failed_pages)))
+    if price_conflicts:
+        issues.append(f'Reconciliation found conflicting public prices on {len(price_conflicts)} product links; '
+                      'sample: ' + ', '.join(sorted(price_conflicts)[:3]))
+    warnings.append(f'Reconciliation recovered {recovered} new distinct links; '
+                    f'now {len(items)}/{expected}')
+    print(f'A1 {section}: RECONCILE DONE recovered={recovered} '
+          f'found={len(items)}/{expected} price_conflicts={len(price_conflicts)}', flush=True)
+    return recovered
+
+
 def crawl(section, max_pages, timeout, pause):
     """Crawl A1 with per-page reconciliation. Never fill missing slots from stale runs.
 
@@ -251,6 +314,9 @@ def crawl(section, max_pages, timeout, pause):
             limit_hit = has_next or len(choices) == 20
             break
         time.sleep(pause)
+    if expected is not None and len(items) < expected and not issues and not limit_hit:
+        reconcile_missing(section, path, items, pages, expected, timeout, pause,
+                          issues, warnings)
     if expected is not None and len(items) < expected:
         warnings.append(f'JSON-LD advertises {expected} items; found {len(items)} distinct links')
     if limit_hit:
