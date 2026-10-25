@@ -17,6 +17,7 @@ LOCK_KEY = 77504433
 
 def prepare_snapshot(results):
     errors = []
+    warnings = []
     selected = {}
     stats = []
     for section in SECTIONS:
@@ -32,7 +33,10 @@ def prepare_snapshot(results):
         if expected is None:
             errors.append(f'{section}: missing expected ItemList count')
         elif found != expected:
-            errors.append(f'{section}: expected {expected} products, got {found}')
+            if found < expected and found >= max(1, int(expected * 0.80)):
+                warnings.append(f'{section}: partial catalog — expected {expected}, found {found}; saving available priced products')
+            else:
+                errors.append(f'{section}: suspicious catalog count — expected {expected}, got {found}')
         if found == 0:
             errors.append(f'{section}: empty catalog')
         priced = 0
@@ -63,7 +67,7 @@ def prepare_snapshot(results):
                       'priced':priced, 'without_price':unpriced})
     if not selected:
         errors.append('no priced products')
-    return {'ready_to_commit':not errors, 'errors':errors, 'statistics':stats,
+    return {'ready_to_commit':not errors, 'errors':errors, 'warnings':warnings, 'statistics':stats,
             'unique_priced':len(selected), 'selected':selected}
 
 
@@ -144,7 +148,7 @@ def run(max_pages=100, pause=1, timeout=25, commit=False):
     summary={k:v for k,v in snapshot.items() if k!='selected'}
     print('A1_SNAPSHOT',json.dumps(summary,ensure_ascii=False),flush=True)
     if not snapshot['ready_to_commit']:
-        print('NOT SAVED: incomplete catalog or conflicting prices; existing supplier untouched',flush=True)
+        print('NOT SAVED: fatal crawl issue, severely incomplete catalog, or conflicting prices; existing supplier untouched',flush=True)
         return 2
     if not commit:
         print('PREVIEW ONLY: database unchanged',flush=True)
