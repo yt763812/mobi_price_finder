@@ -8,6 +8,9 @@ import argparse
 import json
 import re
 import time
+import sys
+import os
+import subprocess
 from decimal import Decimal
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qs, urlencode
@@ -88,16 +91,50 @@ class PageParser(HTMLParser):
                 self.a['text']=' '.join(' '.join(self.a['text']).split())
                 self.anchors.append(self.a); self.a=None
 
-def fetch(url, timeout=25, retries=3):
-    for attempt in range(retries):
+def _single_fetch(url, timeout):
+    """Runs in an isolated child process, so its socket can be forcibly closed."""
+    request = Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (compatible; A1CatalogueAudit/1.0)',
+        'Accept-Language': 'ru-RU,ru;q=0.9',
+    })
+    with urlopen(request, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError('HTTP ' + str(response.status))
+        data = response.read(10_000_001)
+        if len(data) > 10_000_000:
+            raise RuntimeError('HTML exceeds 10 MB safety limit')
+        return data.decode(response.headers.get_content_charset() or 'utf-8', errors='replace')
+
+
+def fetch(url, timeout=25, retries=2):
+    """Hard-deadline HTTP fetch, also safe from threads used by Telegram.
+
+    Separate subprocess makes the limit real even when DNS/TLS stalls.
+    No database access or persistent state in the child process.
+    """
+    deadline = min(max(int(timeout), 3), 12) + 5
+    retries = min(max(int(retries), 1), 2)
+    last_error = None
+    for attempt in range(1, retries + 1):
+        print(f'A1 FETCH attempt={attempt}/{retries} deadline={deadline}s url={url}', flush=True)
         try:
-            request=Request(url,headers={'User-Agent':'Mozilla/5.0 (compatible; A1CatalogueAudit/1.0)', 'Accept-Language':'ru-RU,ru;q=0.9'})
-            with urlopen(request,timeout=timeout) as response:
-                if response.status!=200: raise RuntimeError('HTTP '+str(response.status))
-                return response.read(10_000_000).decode(response.headers.get_content_charset() or 'utf-8',errors='replace')
-        except Exception:
-            if attempt+1==retries: raise
-            time.sleep(min(2**attempt, 5))
+            proc = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), '--_fetch-url', url,
+                 '--_socket-timeout', str(deadline - 5)],
+                capture_output=True, timeout=deadline, check=False,
+            )
+            if proc.returncode != 0:
+                details = proc.stderr.decode('utf-8', errors='replace').strip().splitlines()
+                raise RuntimeError((details[-1] if details else 'child fetch failed')[:240])
+            return proc.stdout.decode('utf-8', errors='replace')
+        except subprocess.TimeoutExpired:
+            last_error = f'HTTP hard timeout after {deadline}s'
+        except Exception as exc:
+            last_error = f'{type(exc).__name__}: {exc}'
+        print(f'A1 FETCH FAILED attempt={attempt}/{retries}: {last_error}', flush=True)
+        if attempt < retries:
+            time.sleep(0.5)
+    raise RuntimeError(f'A1 fetch failed for {url}: {last_error}')
 
 def expected_count(parser):
     for obj in parser.jsonld:
@@ -140,6 +177,7 @@ def crawl(section, max_pages, timeout, pause):
     page_retries = 0
     for page in range(1, max_pages + 1):
         url = page_url(path, page)
+        print(f'A1 {section}: starting page={page}', flush=True)
         parsed, choices = _page_choices(fetch(url, timeout))
         if page == 1:
             expected = expected_count(parsed)
@@ -159,7 +197,8 @@ def crawl(section, max_pages, timeout, pause):
             def quality(candidate):
                 _, links, _ = candidate
                 return (len(set(links) - set(items)), len(links))
-            for attempt in range(3):
+            for attempt in range(2):
+                print(f'A1 {section}: short/overlap page={page}; reread={attempt+1}/2', flush=True)
                 time.sleep(max(pause, 0.3))
                 try:
                     alternative_parsed, alternative_choices = _page_choices(fetch(url, timeout))
@@ -256,4 +295,14 @@ def main():
     print('SUMMARY',json.dumps(summary,ensure_ascii=False),flush=True)
     print('REPORT',args.json,flush=True)
     print('NO DB WRITES',flush=True)
-if __name__=='__main__': main()
+if __name__ == '__main__':
+    if len(sys.argv) >= 4 and sys.argv[1] == '--_fetch-url':
+        # Internal child entrypoint; never invoke main() or import the database.
+        try:
+            sys.stdout.buffer.write(_single_fetch(sys.argv[2], int(sys.argv[4])).encode('utf-8'))
+        except Exception as exc:
+            print(f'{type(exc).__name__}: {exc}', file=sys.stderr)
+            sys.exit(2)
+    else:
+        main()
+
