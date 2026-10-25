@@ -19,6 +19,8 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 from myfin_rate import MYFIN_URL, fetch_bsb_usd_sale
+from mts_daily_scheduler import post_init as mts_post_init
+import a1_bot_integration
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
@@ -1638,16 +1640,58 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Telegram error: %s", context.error, exc_info=context.error)
 
 
+async def mts_update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only manual MTS refresh; runs outside Telegram event loop."""
+    if not is_owner(update):
+        await update.effective_message.reply_text('🔒 Запуск парсера доступен только владельцу.')
+        return
+    import asyncio
+    if os.getenv('MTS_MANUAL_ENABLED', '0').strip() != '1':
+        await update.effective_message.reply_text('Ручной сбор выключен (MTS_MANUAL_ENABLED=0).')
+        return
+    state = context.application.bot_data.setdefault('mts_manual_state', {'running': False})
+    if state['running']:
+        await update.effective_message.reply_text('⏳ Сбор МТС уже запущен через Telegram.')
+        return
+    state['running'] = True
+    chat_id = update.effective_chat.id
+    await update.effective_message.reply_text('🔄 Запускаю сбор МТС: смартфоны, планшеты, часы, наушники, ноутбуки. Результат пришлю сюда.')
+    async def perform():
+        try:
+            from web_worker import CATEGORIES, run
+            result = await asyncio.to_thread(run, CATEGORIES, int(os.getenv('MTS_MAX_PAGES', '50')))
+            descriptions = {
+                0: '✅ Сбор МТС завершён; результаты сохранены в web_offers.',
+                2: '⚠️ Сбор завершился с ошибками. Проверь Deploy Logs; часть категорий могла сохраниться.',
+                3: '⏳ Другой сбор МТС уже выполняется. Новый не запущен.',
+            }
+            await context.bot.send_message(chat_id, descriptions.get(result, f'MTS: код завершения {result}'))
+        except Exception:
+            logger.exception('Manual MTS crawl failed')
+            await context.bot.send_message(chat_id, '❌ Сбор МТС завершился ошибкой. Проверь Deploy Logs.')
+        finally:
+            state['running'] = False
+    context.application.create_task(perform(), name='mts_manual_update')
+
+
+async def combined_post_init(application):
+    """Attach both store schedulers to the existing Telegram application."""
+    await mts_post_init(application)
+    await a1_bot_integration.post_init(application)
+
+
 def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_init(combined_post_init).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CommandHandler('cancelrate', cancelrate))
+    app.add_handler(CommandHandler('mtsupdate', mts_update_command))
+    a1_bot_integration.register(app)
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
