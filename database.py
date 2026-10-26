@@ -373,29 +373,18 @@ def _replace_supplier_offers(supplier_id, rows, currency=None, tax_status=None):
             if currency not in ('USD', 'BYN', 'RUB', 'EUR') or tax_status not in ('with_vat', 'without_vat'):
                 raise ValueError('Сначала настрой валюту и НДС поставщика.')
             cur.execute('DELETE FROM offers WHERE supplier_id=%s', (supplier_id,))
-            # Batch inserts reduce database round trips, especially on Railway.
-            insert_sql = """
-                INSERT INTO offers (supplier_id, signature, original_name, brand, model,
-                    storage_gb, color, region, sim, condition_tags, warnings, ram_gb,
-                    price, currency, tax_status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
-            """
-            def insert_parameters():
-                for signature, (product, amount) in unique.items():
-                    yield (supplier_id, signature, product['original'], product.get('brand'),
-                           product.get('model'), product.get('storage_gb'), product.get('color'),
-                           product.get('region'), product.get('sim'),
-                           json.dumps(product.get('condition') or [], ensure_ascii=False),
-                           json.dumps(product.get('warnings') or [], ensure_ascii=False),
-                           product.get('ram_gb'), amount, currency, tax_status)
-            batch = []
-            for params in insert_parameters():
-                batch.append(params)
-                if len(batch) >= 1000:
-                    cur.executemany(insert_sql, batch)
-                    batch.clear()
-            if batch:
-                cur.executemany(insert_sql, batch)
+            for signature, (product, amount) in unique.items():
+                cur.execute("""
+                    INSERT INTO offers (supplier_id, signature, original_name, brand, model,
+                        storage_gb, color, region, sim, condition_tags, warnings, ram_gb,
+                        price, currency, tax_status)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
+                """, (supplier_id, signature, product['original'], product.get('brand'),
+                      product.get('model'), product.get('storage_gb'), product.get('color'),
+                      product.get('region'), product.get('sim'),
+                      json.dumps(product.get('condition') or [], ensure_ascii=False),
+                      json.dumps(product.get('warnings') or [], ensure_ascii=False),
+                      product.get('ram_gb'), amount, currency, tax_status))
             # Same transaction as the snapshot: a failed import cannot move the timestamp.
             cur.execute('UPDATE suppliers SET last_price_import_at = now() WHERE id = %s', (supplier_id,))
     return {'saved': len(unique), 'skipped': len(rejected),
