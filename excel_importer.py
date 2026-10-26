@@ -211,7 +211,17 @@ def inspect_xlsx(data, tax_status='with_vat'):
                                'color': colors[0] if colors else None,
                                'region': regions[0] if regions else None}
                     price_header = _clean(row[prices[0]])
-                    ambiguous = len(names) > 1 or (len(prices) > 1 and _header(row[prices[0]]) == _header(row[prices[1]]))
+                    # Multiple name columns are safe when a clear descriptive column wins
+                    # over an auxiliary product code / short product label.
+                    chosen_label = _header(row[names[0]])
+                    descriptive = {'описание', 'наименование', 'название товара', 'название'}
+                    name_ambiguous = len(names) > 1 and not (
+                        chosen_label in descriptive
+                        and all(_header(row[i]) not in descriptive for i in names[1:])
+                    )
+                    ambiguous = name_ambiguous or (
+                        len(prices) > 1 and _header(row[prices[0]]) == _header(row[prices[1]])
+                    )
                     break
             if mapping is None:
                 mapping = _positional_mapping(ws)
