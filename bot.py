@@ -1036,19 +1036,24 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.message.reply_text('⏳ Сохраняю Excel в PostgreSQL. Подожди...')
         try:
-            # Re-parse the exact staged file; no Telegram re-download required.
-            extracted, skipped = [], 0
-            selected_items = [it for it in staged['sheets'] if it.get('enabled')]
-            for selected in selected_items:
-                batch, missing = extract_xlsx(selected.get('data', staged['data']), selected['sheet'], selected['mapping'], selected['header_row'], default_brand=_supplier_default_brand(sid))
-                extracted.extend(batch)
-                skipped += missing
-            parsed = [(parse_product(name), price) for name, price in extracted]
-            report = save_excel_rows(sid, parsed, staged['currency'], staged['tax_status'])
+            def _process_import():
+                # Re-parse the exact staged file; no Telegram re-download required.
+                extracted, skipped = [], 0
+                selected_items = [it for it in staged['sheets'] if it.get('enabled')]
+                for selected in selected_items:
+                    batch, missing = extract_xlsx(selected.get('data', staged['data']), selected['sheet'], selected['mapping'], selected['header_row'], default_brand=_supplier_default_brand(sid))
+                    extracted.extend(batch)
+                    skipped += missing
+                parsed = [(parse_product(name), price) for name, price in extracted]
+                report = save_excel_rows(sid, parsed, staged['currency'], staged['tax_status'])
+                return report, selected_items, skipped
+            report, selected_items, skipped = await asyncio.to_thread(_process_import)
             context.user_data.pop('excel_pending', None)
             try:
-                profiles = [{**it, 'fingerprint': sheet_fingerprint(it.get('data', staged['data']), it['sheet'], it['header_row'], it['mapping'])} for it in selected_items]
-                save_excel_profiles(sid, profiles)
+                def _save_profiles():
+                    profiles = [{**it, 'fingerprint': sheet_fingerprint(it.get('data', staged['data']), it['sheet'], it['header_row'], it['mapping'])} for it in selected_items]
+                    save_excel_profiles(sid, profiles)
+                await asyncio.to_thread(_save_profiles)
             except Exception:
                 logger.exception('Excel profiles save failed')
         except Exception:
