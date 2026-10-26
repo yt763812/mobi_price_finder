@@ -84,7 +84,16 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                    'pagination_anomalies': result.pagination_anomalies or []}
             minimum = BASELINE_MIN_PAGES.get(section, 1)
             if result.pages < minimum:
-                row['error'] = f'pages {result.pages} below historical baseline {minimum}'
+                baseline_message = f'pages {result.pages} below historical baseline {minimum}'
+                if section == 'accessories_all':
+                    # This category changes size on the live MTS site. A historical
+                    # page count alone must not discard an otherwise valid crawl.
+                    # Keep the warning visible and retain all structural checks.
+                    row['coverage_warning'] = baseline_message
+                    emit(f'COVERAGE_WARNING MTS {section}: {baseline_message}; '
+                         'allowing save only if all other validation passes')
+                else:
+                    row['error'] = baseline_message
             if result.incomplete or result.issues or not result.products:
                 row['error'] = row.get('error') or 'incomplete, invalid or empty section'
             if row.get('error'):
