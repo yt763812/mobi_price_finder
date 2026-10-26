@@ -1433,25 +1433,30 @@ COLOR_LABELS = {'black': 'Black', 'white': 'White', 'blue': 'Blue',
                 'gold': 'Gold', 'pink': 'Pink'}
 
 
-def format_offer(offer, index):
+def format_offer(offer, index, rate=None):
     parsed = parse_product(offer['original_name'])
     def get(key):
         return parsed.get(key) or offer.get(key)
     memory = get('storage_gb')
     memory_label = f'{memory} GB' if memory is not None else 'Не указан'
-    condition = parsed.get('condition') or offer.get('condition_tags') or []
-    condition_labels = {'activated': 'Активирован', 'sealed': 'Запечатан',
-                        'refurbished': 'Восстановлен', 'used': 'Б/у'}
-    condition_label = ', '.join(condition_labels.get(c, c) for c in condition) if condition else 'Не указано'
-    vat = {'with_vat': 'с НДС', 'without_vat': 'без НДС',
-           'unknown': 'НДС не указан'}.get(offer.get('tax_status'), 'НДС не указан')
+    try:
+        price = Decimal(str(offer['price']))
+    except (InvalidOperation, TypeError, ValueError):
+        price = None
+    currency = (offer.get('currency') or '').upper()
+    if price is not None and currency == 'BYN':
+        price_label = f"{price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)} BYN"
+    elif price is not None and currency == 'USD' and rate is not None and rate > 0:
+        byn = (price * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        price_label = f"{price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)} USD ({byn} BYN)"
+    else:
+        # No configured RUB/EUR conversion rate: never mislabel foreign prices as BYN.
+        price_label = f"{offer['price']} {currency or 'валюта не указана'}"
     return (f"{index}. 🏪 {offer['supplier_name']}\n"
             f"{offer['original_name']}\n"
-            f"💰 {offer['price']} {offer['currency']} ({vat})\n"
+            f"💰 {price_label}\n"
             f"Память: {memory_label} | Цвет: {_display(get('color'), COLOR_LABELS)}\n"
-            f"SIM: {_display(get('sim'), SIM_LABELS)} | Регион: {_display(get('region'))}\n"
-            f"Состояние: {condition_label}")
-
+            f"SIM: {_display(get('sim'), SIM_LABELS)} | Регион: {_display(get('region'))}")
 
 def _interpret_search_query(query_text):
     """Short iPhone-style queries default to iPhone, never to Redmi/Xiaomi.
@@ -1489,16 +1494,12 @@ def _offer_sort_key(offer, rate):
 
 
 def _render_offer(offer, index, rate):
-    result = format_offer(offer, index)
+    result = format_offer(offer, index, rate)
     days = offer.get('delivery_workdays')
     when = _delivery_date(days)
     result += f'\n🚚 Доставка: {_delivery_label(days)}'
     if when is not None:
         result += f' (ориентировочно {when})'
-    converted = _usd_equivalent(offer, rate)
-    if converted is not None and (offer.get('currency') or '').upper() == 'BYN':
-        usd = converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        result += f'\n≈ {usd} USD (по курсу {rate} BYN/USD)'
     return result
 
 
@@ -1581,26 +1582,10 @@ async def run_search(message, query_text, context):
         return
     rate = get_usd_byn_rate()
     ordered = sorted(matches, key=lambda o: _offer_sort_key(o, rate))
-    selected, counts = [], {}
-    for offer in ordered:
-        sid = offer['supplier_id']
-        if counts.get(sid, 0) >= 3:
-            continue
-        selected.append(offer)
-        counts[sid] = counts.get(sid, 0) + 1
-        if len(selected) == 20:
-            break
-    token = context.user_data.get('search_token', 0) + 1
-    context.user_data['search_token'] = token
-    context.user_data['search_result_snapshot'] = {
-        'token': token, 'query': query_text, 'rate': rate,
-        'all': ordered, 'top': selected,
-    }
+    # Send every match, without a per-supplier or top-20 cap.
     header = (f'🔎 {query_text}\nНайдено предложений: {len(ordered)}\n'
-              f'Показано: {len(selected)} (не более 3 от поставщика)\n'
               f'💱 1 USD = {rate} BYN')
-    keyboard = _search_nav_keyboard(token, 0, 1, False) if len(ordered) > len(selected) else None
-    await _send_search_blocks(message, header, selected, rate, keyboard=keyboard)
+    await _send_search_blocks(message, header, ordered, rate)
 
 
 async def search_results_callback(query, context, action):
