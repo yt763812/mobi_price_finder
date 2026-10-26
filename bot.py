@@ -1327,8 +1327,8 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft['version'] += 1
     if doc and doc.file_unique_id not in draft['seen']:
         draft['seen'].add(doc.file_unique_id)
-        if not doc.file_name or not doc.file_name.lower().endswith('.xlsx'):
-            draft['errors'].append(f'{doc.file_name or "Без имени"}: нужен файл .xlsx')
+        if not doc.file_name or not doc.file_name.lower().endswith(('.xlsx', '.xls')):
+            draft['errors'].append(f'{doc.file_name or "Без имени"}: нужен файл .xlsx или .xls')
         elif doc.file_size and doc.file_size > MAX_FILE_BYTES:
             draft['errors'].append(f'{doc.file_name}: превышен лимит размера файла')
         else:
