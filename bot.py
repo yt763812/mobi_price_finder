@@ -1483,14 +1483,22 @@ def _usd_equivalent(offer, rate):
     return None
 
 
-def _offer_sort_key(offer, rate):
+def _offer_sort_key(offer, rate, mode='delivery'):
     days = offer.get('delivery_workdays')
     amount = _usd_equivalent(offer, rate)
-    return (days is None, days if days is not None else 9999,
-            amount is None, amount if amount is not None else Decimal('Infinity'),
-            (offer.get('currency') or '').upper(),
-            (offer.get('supplier_name') or '').casefold(),
-            (offer.get('original_name') or '').casefold())
+    delivery_key = (days is None, days if days is not None else 9999)
+    price_key = (amount is None, amount if amount is not None else Decimal('Infinity'))
+    tie = ((offer.get('currency') or '').upper(),
+           (offer.get('supplier_name') or '').casefold(),
+           (offer.get('original_name') or '').casefold())
+    return (*price_key, *delivery_key, *tie) if mode == 'price' else (*delivery_key, *price_key, *tie)
+
+
+def _sort_choice_keyboard(token):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton('🚚 По доставке', callback_data=f'sr:delivery:{token}:0'),
+        InlineKeyboardButton('💰 По цене', callback_data=f'sr:price:{token}:0'),
+    ]])
 
 
 def _render_offer(offer, index, rate):
@@ -1581,39 +1589,34 @@ async def run_search(message, query_text, context):
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
         return
     rate = get_usd_byn_rate()
-    ordered = sorted(matches, key=lambda o: _offer_sort_key(o, rate))
-    # Send every match, without a per-supplier or top-20 cap.
-    header = (f'🔎 {query_text}\nНайдено предложений: {len(ordered)}\n'
-              f'💱 1 USD = {rate} BYN')
-    await _send_search_blocks(message, header, ordered, rate)
+    token = int(time.time_ns() % 1000000000000)
+    context.user_data['search_result_snapshot'] = {
+        'token': token, 'query': query_text, 'all': matches, 'rate': rate,
+    }
+    await message.reply_text(
+        f'🔎 {query_text}\nНайдено предложений: {len(matches)}\n'
+        'Как отсортировать результаты?',
+        reply_markup=_sort_choice_keyboard(token),
+    )
 
 
 async def search_results_callback(query, context, action):
     parts = action.split(':')
     snapshot = context.user_data.get('search_result_snapshot')
-    if len(parts) != 4 or not snapshot or not parts[2].isdigit() or not parts[3].isdigit() or int(parts[2]) != snapshot['token']:
+    if (len(parts) != 4 or not snapshot or
+            parts[2] != str(snapshot['token'])):
         await query.message.reply_text('Результаты этого поиска устарели. Повтори запрос.')
         return
     mode = parts[1]
-    page = int(parts[3])
-    if mode not in ('all', 'top'):
+    if mode not in ('delivery', 'price'):
         return
-    if mode == 'all':
-        items = snapshot['all']
-        pages = max(1, (len(items) + 19) // 20)
-        if page >= pages:
-            return
-        visible = items[page*20:(page+1)*20]
-        header = (f"🔎 {snapshot['query']} — все предложения\n"
-                  f"Найдено: {len(items)}\nПоказаны: {page*20+1}–{page*20+len(visible)} из {len(items)}")
-        keyboard = _search_nav_keyboard(snapshot['token'], page, pages, True)
-        await _send_search_blocks(query.message, header, visible, snapshot['rate'], page*20, keyboard)
-    else:
-        items = snapshot['top']
-        header = (f"🔎 {snapshot['query']} — ТОП-20\n"
-                  f"Найдено: {len(snapshot['all'])}\nПоказано: {len(items)} (не более 3 от поставщика)")
-        keyboard = _search_nav_keyboard(snapshot['token'], 0, 1, False) if len(snapshot['all']) > len(items) else None
-        await _send_search_blocks(query.message, header, items, snapshot['rate'], keyboard=keyboard)
+    rate = snapshot['rate']
+    ordered = sorted(snapshot['all'], key=lambda offer: _offer_sort_key(offer, rate, mode))
+    mode_label = 'сроку доставки' if mode == 'delivery' else 'цене'
+    header = (f"🔎 {snapshot['query']}\nНайдено предложений: {len(ordered)}\n"
+              f"Сортировка: по {mode_label}\n💱 1 USD = {rate} BYN")
+    await _send_search_blocks(query.message, header, ordered, rate,
+                              keyboard=_sort_choice_keyboard(snapshot['token']))
 
 
 async def cancelrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
