@@ -6,7 +6,7 @@ from collections import Counter
 from openpyxl import load_workbook
 from product_parser import parse_product, section_brand, contextual_name
 
-NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название', 'название товара', 'раздел / наименование', 'товар', 'product', 'model', 'item', 'description')
+NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название', 'название товара', 'раздел / наименование', 'товар', 'product', 'model', 'item', 'description', 'описание', 'продукт')
 PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная', 'цена прайса с ндс', 'алтерн-цена без ндс', 'алтерн-цена с ндс')
 BRAND_HEADERS = ('бренд', 'брэнд', 'brand', 'производитель')
 COLOR_HEADERS = ('цвет', 'color', 'colour')
@@ -184,7 +184,7 @@ def inspect_xlsx(data, tax_status='with_vat'):
     try:
         sheets = []
         for ws in wb.worksheets:
-            if _header(ws.title) in ('информация', 'сервис'):
+            if _header(ws.title) in ('информация', 'инфо', 'сервис'):
                 continue
             multi = _multirow_price_mapping(ws, tax_status)
             if multi and multi['status'] != 'ok':
@@ -196,6 +196,8 @@ def inspect_xlsx(data, tax_status='with_vat'):
             ambiguous = False
             for row_num, row in enumerate(ws.iter_rows(min_row=1, max_row=25, values_only=True), 1):
                 names = _indices(row, NAME_HEADERS)
+                # Prefer descriptive product names over SKU-like 'Продукт' columns.
+                names.sort(key=lambda i: (0 if _header(row[i]) in ('описание', 'наименование', 'название товара', 'название') else 1, i))
                 prices = _preferred_price(row, tax_status)
                 brands = _indices(row, BRAND_HEADERS)
                 categories = _indices(row, CATEGORY_HEADERS)
