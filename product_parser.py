@@ -88,18 +88,17 @@ def detect_iphone(text):
     if re.search(r"(?<!\w)(?:iphone|айфон)\s+air(?!\w)", t):
         return "iPhone Air"
     m = re.search(
-        r"(?:iphone|айфон|айфона)\s*(\d{1,2})"
-        r"(?:\s*(pro\s*max|про\s*макс|promax|про|pro|plus|плюс|air))?",
-        t,
+        r"(?<!\w)(?:iphone|айфон|айфона)\s*(\d{1,2})"
+        r"(?:\s*(pro\s*max|про\s*макс|promax|про|pro|plus|плюс|mini|air|fe|e|е))?"
+        r"(?![a-zа-я0-9])", t,
     )
     if not m:
-        if re.search(r"(?<!\w)(?:iphone|айфон)\s*air(?!\w)", t):
-            return "iPhone Air"
         return None
     suffix = (m.group(2) or "").replace(" ", "")
     labels = {"promax": "Pro Max", "промакс": "Pro Max",
-              "pro": "Pro", "про": "Pro", "plus": "Plus", "плюс": "Plus", "air": "Air"}
-    return f"iPhone {m.group(1)}" + (f" {labels[suffix]}" if suffix in labels else "")
+              "pro": "Pro", "про": "Pro", "plus": "Plus", "плюс": "Plus",
+              "air": "Air", "mini": "mini", "e": "e", "е": "e", "fe": "FE"}
+    return f"iPhone {m.group(1)}" + ((labels[suffix] if suffix == "e" or suffix == "е" else f" {labels[suffix]}") if suffix in labels else "")
 
 
 def detect_region(text):
