@@ -4,42 +4,10 @@ import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from collections import Counter
 from openpyxl import load_workbook
-
-class _XlsSheet:
-    def __init__(self, sheet):
-        self._sheet = sheet
-        self.title = sheet.name
-        self.max_row = sheet.nrows
-        self.max_column = sheet.ncols
-
-    def iter_rows(self, min_row=1, max_row=None, values_only=True):
-        stop = min(self.max_row, max_row if max_row is not None else self.max_row)
-        for i in range(max(0, min_row - 1), stop):
-            yield tuple(self._sheet.row_values(i))
-
-class _XlsBook:
-    def __init__(self, data):
-        try:
-            import xlrd
-        except ImportError as exc:
-            raise RuntimeError("Для чтения XLS установи зависимость xlrd") from exc
-        self._book = xlrd.open_workbook(file_contents=data, on_demand=True)
-        self.worksheets = [_XlsSheet(self._book.sheet_by_index(i)) for i in range(self._book.nsheets)]
-
-    def __getitem__(self, name):
-        return next(s for s in self.worksheets if s.title == name)
-
-    def close(self):
-        self._book.release_resources()
-
-def _open_price_book(data):
-    if data[:8] == bytes.fromhex("D0CF11E0A1B11AE1"):
-        return _XlsBook(data)
-    return load_workbook(io.BytesIO(data), read_only=True, data_only=True)
 from product_parser import parse_product, section_brand, contextual_name
 
 NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название', 'название товара', 'раздел / наименование', 'товар', 'product', 'model', 'item', 'description', 'описание', 'продукт')
-PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная', 'цена прайса с ндс', 'алтерн-цена без ндс', 'алтерн-цена с ндс', 'предоплата byn c ндс', 'предоплата byn с ндс', 'предоплата с ндс', 'кредит byn с ндс')
+PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная', 'цена прайса с ндс', 'алтерн-цена без ндс', 'алтерн-цена с ндс')
 BRAND_HEADERS = ('бренд', 'брэнд', 'brand', 'производитель')
 COLOR_HEADERS = ('цвет', 'color', 'colour')
 REGION_HEADERS = ('происхождение', 'регион', 'страна', 'region')
@@ -74,8 +42,6 @@ def _preferred_price(row, tax_status="with_vat"):
                           'цена прайса с ндс': 8}
         if value in priorities: return (priorities[value], i)
         if any(x in value for x in ('ррц', 'розничная')): return (10, i)
-        if 'предоплата' in value: return (2, i)
-        if 'кредит' in value: return (6, i)
         if 'usd' in value or '$' in value: return (3, i)
         return (4, i)
     return sorted(indices, key=rank)
@@ -214,7 +180,7 @@ def _multirow_price_mapping(ws, tax_status='with_vat'):
 def inspect_xlsx(data, tax_status='with_vat'):
     if len(data) > MAX_FILE_BYTES:
         raise ValueError('Файл больше 12 МБ. Пришли файл поменьше.')
-    wb = _open_price_book(data)
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         sheets = []
         for ws in wb.worksheets:
@@ -247,14 +213,11 @@ def inspect_xlsx(data, tax_status='with_vat'):
                     price_header = _clean(row[prices[0]])
                     # Multiple name columns are safe when a clear descriptive column wins
                     # over an auxiliary product code / short product label.
-                    names.sort(key=lambda i: ({'наименование': 0, 'название товара': 1, 'название': 2, 'описание': 3, 'модель': 4, 'продукт': 5}.get(_header(row[i]), 6), i))
-                    mapping['name'] = names[0]
                     chosen_label = _header(row[names[0]])
                     descriptive = {'описание', 'наименование', 'название товара', 'название'}
-                    preferred = {'наименование', 'название товара', 'название'}
                     name_ambiguous = len(names) > 1 and not (
                         chosen_label in descriptive
-                        and all(_header(row[i]) not in preferred for i in names[1:])
+                        and all(_header(row[i]) not in descriptive for i in names[1:])
                     )
                     ambiguous = name_ambiguous or (
                         len(prices) > 1 and _header(row[prices[0]]) == _header(row[prices[1]])
@@ -323,7 +286,7 @@ def extract_xlsx(data, sheet_name, mapping, header_row, default_brand=None):
     """Extract all validated rows from one explicitly selected sheet."""
     if len(data) > MAX_FILE_BYTES:
         raise ValueError('Файл слишком большой')
-    wb = _open_price_book(data)
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         ws = wb[sheet_name]
         if ws.max_row and ws.max_row > MAX_ROWS:
@@ -364,7 +327,7 @@ def extract_xlsx(data, sheet_name, mapping, header_row, default_brand=None):
 
 def sheet_columns(data, sheet_name, max_columns=40):
     """Candidate columns and small excerpts for interactive manual selection."""
-    wb = _open_price_book(data)
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         ws = wb[sheet_name]
         width = min(ws.max_column or 0, max_columns)
@@ -386,7 +349,7 @@ def sheet_columns(data, sheet_name, max_columns=40):
 
 def inspect_mapping(data, sheet_name, mapping, header_row):
     """Score a proposed mapping using actual priced product rows."""
-    wb = _open_price_book(data)
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         ws = wb[sheet_name]
         if ws.max_row and ws.max_row > MAX_ROWS:
@@ -420,7 +383,7 @@ def inspect_mapping(data, sheet_name, mapping, header_row):
 
 def sheet_fingerprint(data, sheet_name, header_row, mapping):
     """A light column signature; do not reuse a profile on a shifted/changed sheet."""
-    wb = _open_price_book(data)
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     try:
         ws = wb[sheet_name]
         if header_row:
