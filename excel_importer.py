@@ -211,13 +211,30 @@ def _multirow_price_mapping(ws, tax_status='with_vat'):
                 'header_row': i + 2, 'price_header': f'Цена — {preferred}'}
     return None
 
+# Administrative tabs in CP_Stock are not price lists. Keep the three
+# product tabs (including discounted goods) eligible for normal detection.
+CP_STOCK_ADMIN_SHEETS = frozenset({
+    'заголовок', 'акции', 'заказ', 'инструкция',
+    'услуги по ремонту', 'сервисный центр',
+})
+
+def _skip_administrative_sheet(sheet_name, workbook_sheets):
+    names = {_header(name) for name in workbook_sheets}
+    cp_stock_layout = {'складцены', 'уцененные товары', 'конфигуратор ноутбуков'}
+    return (cp_stock_layout.issubset(names)
+            and _header(sheet_name) in CP_STOCK_ADMIN_SHEETS)
+
+
 def inspect_xlsx(data, tax_status='with_vat'):
     if len(data) > MAX_FILE_BYTES:
         raise ValueError('Файл больше 12 МБ. Пришли файл поменьше.')
     wb = _open_price_book(data)
     try:
         sheets = []
+        workbook_sheet_names = [ws.title for ws in wb.worksheets]
         for ws in wb.worksheets:
+            if _skip_administrative_sheet(ws.title, workbook_sheet_names):
+                continue
             if _header(ws.title) in ('информация', 'инфо', 'сервис'):
                 continue
             multi = _multirow_price_mapping(ws, tax_status)
