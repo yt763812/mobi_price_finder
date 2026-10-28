@@ -1438,6 +1438,82 @@ COLOR_LABELS = {'black': 'Black', 'white': 'White', 'blue': 'Blue',
                 'gold': 'Gold', 'pink': 'Pink'}
 
 
+# TV/monitor diagonals are often encoded in the model, not in a separate field.
+SCREEN_DIAGONALS = {
+    'tv': {24, 28, 32, 40, 42, 43, 48, 49, 50, 55, 58, 60, 65, 70, 75, 77, 85, 86, 98, 100, 115},
+    'monitor': {15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 34, 35, 38, 40, 42, 43, 45, 49, 57},
+}
+SCREEN_PAGE_SIZE = 10
+
+
+def _screen_category(text):
+    t = str(text).casefold().replace('ё', 'е')
+    if re.search(r'(?<!\w)(?:телевизор\w*|телик\w*|tv)(?!\w)', t):
+        return 'tv'
+    if re.search(r'(?<!\w)(?:монитор\w*|monitor\w*)(?!\w)', t):
+        return 'monitor'
+    return None
+
+
+def _screen_diagonal(name, category):
+    """Recognize explicit inch sizes or conservative, manufacturer-style model prefixes."""
+    t = str(name).upper().replace('С', 'C')  # Cyrillic C occurs in some SKUs.
+    allowed = SCREEN_DIAGONALS[category]
+    # Explicit 27-inch / 27″ / 27 дюймов; no bare arbitrary digits.
+    for pattern in (r'(?<!\d)(\d{2,3})\s*(?:[\"″]|ДЮЙМ\w*|INCH(?:ES)?)(?!\w)',
+                    r'(?<!\w)(?:ДИАГОНАЛЬ|DIAGONAL)\s*[:=-]?\s*(\d{2,3})(?!\d)'):
+        for match in re.finditer(pattern, t):
+            value = int(match.group(1))
+            if value in allowed:
+                return value
+    # Xiaomi L75MC..., Samsung UE55... / QE65..., LG 55U..., TCL 55C..., etc.
+    models = ([r'(?<![A-Z0-9])L(\d{2,3})[A-Z]',
+               r'(?<![A-Z0-9])(?:UE|QE|QN|Q[E]?|KD|XR|K|OLED)(\d{2,3})[A-Z0-9]',
+               r'(?<![A-Z0-9])(\d{2,3})(?:[A-Z]{1,3}\d|[A-Z]{2,})']
+              if category == 'tv' else
+              [r'(?<![A-Z0-9])(?:LS|27|M|G|S|P|VG|VA|XG|XV|AW|U)(\d{2})[A-Z]',
+               r'(?<![A-Z0-9])(\d{2})(?:[A-Z]{2,}\d|[A-Z]{2,})'])
+    for pattern in models:
+        for match in re.finditer(pattern, t):
+            value = int(match.group(1))
+            if value in allowed:
+                return value
+    return None
+
+
+def _screen_query_parts(text, category):
+    t = re.sub(r'(?i)(?<!\w)(?:телевизор\w*|телик\w*|монитор\w*|monitor\w*|tv)(?!\w)', ' ', text)
+    size = re.search(r'(?<!\w)(\d{2,3})\s*(?:[\"″]|дюйм\w*|inch(?:es)?|(?=\s|$))', t, re.I)
+    diagonal = int(size.group(1)) if size and int(size.group(1)) in SCREEN_DIAGONALS[category] else None
+    if diagonal is not None:
+        t = t[:size.start()] + ' ' + t[size.end():]
+    return diagonal, _search_normalize(t)
+
+
+def _screen_offer_matches(offer, category, terms):
+    name = offer['original_name']
+    if _screen_category(name) != category:
+        return False
+    tokens = _search_normalize(name)
+    return all(token in tokens for token in terms)
+
+
+def _screen_diagonal_keyboard(token, matches, selected=None):
+    counts = {}
+    for offer in matches:
+        d = _screen_diagonal(offer['original_name'], _screen_category(offer['original_name']))
+        counts[d] = counts.get(d, 0) + 1
+    sizes = sorted(d for d in counts if d is not None)
+    rows = []
+    for i in range(0, len(sizes), 3):
+        rows.append([InlineKeyboardButton(f'{d}″ ({counts[d]})' + (' ✓' if selected == d else ''),
+                                        callback_data=f'sr:diag:{token}:{d}') for d in sizes[i:i+3]])
+    if None in counts:
+        rows.append([InlineKeyboardButton(f'❔ Не определена ({counts[None]})', callback_data=f'sr:diag:{token}:unknown')])
+    rows.append([InlineKeyboardButton(f'📋 Все диагонали ({len(matches)})', callback_data=f'sr:diag:{token}:any')])
+    return InlineKeyboardMarkup(rows)
+
+
 def format_offer(offer, index, rate=None):
     parsed = parse_product(offer['original_name'])
     def get(key):
@@ -1457,11 +1533,17 @@ def format_offer(offer, index, rate=None):
     else:
         # No configured RUB/EUR conversion rate: never mislabel foreign prices as BYN.
         price_label = f"{offer['price']} {currency or 'валюта не указана'}"
+    category = _screen_category(offer['original_name'])
+    if category:
+        diagonal = _screen_diagonal(offer['original_name'], category)
+        specs = f"📺 Диагональ: {diagonal}″" if diagonal else "📺 Диагональ: не определена"
+    else:
+        specs = (f"Память: {memory_label} | Цвет: {_display(get('color'), COLOR_LABELS)}\n"
+                 f"SIM: {_display(get('sim'), SIM_LABELS)} | Регион: {_display(get('region'))}")
     return (f"{index}. 🏪 {offer['supplier_name']}\n"
             f"{offer['original_name']}\n"
             f"💰 {price_label}\n"
-            f"Память: {memory_label} | Цвет: {_display(get('color'), COLOR_LABELS)}\n"
-            f"SIM: {_display(get('sim'), SIM_LABELS)} | Регион: {_display(get('region'))}")
+            f"{specs}")
 
 def _interpret_search_query(query_text):
     """Short iPhone-style queries default to iPhone, never to Redmi/Xiaomi.
@@ -1516,20 +1598,21 @@ def _render_offer(offer, index, rate):
     return result
 
 
-def _search_nav_keyboard(token, page, pages, full):
-    buttons = []
-    if full:
-        navigation = []
-        if page > 0:
-            navigation.append(InlineKeyboardButton('◀️ Назад', callback_data=f'sr:all:{token}:{page-1}'))
-        navigation.append(InlineKeyboardButton(f'{page+1}/{pages}', callback_data=f'sr:all:{token}:{page}'))
-        if page + 1 < pages:
-            navigation.append(InlineKeyboardButton('Вперёд ▶️', callback_data=f'sr:all:{token}:{page+1}'))
-        buttons.append(navigation)
-        buttons.append([InlineKeyboardButton('↩️ Вернуться к ТОП-20', callback_data=f'sr:top:{token}:0')])
-    else:
-        buttons.append([InlineKeyboardButton('📋 Показать все предложения', callback_data=f'sr:all:{token}:0')])
-    return InlineKeyboardMarkup(buttons)
+def _search_nav_keyboard(token, page, pages, mode, screen=False):
+    rows = [[InlineKeyboardButton('🚚 Доставка' + (' ✓' if mode == 'delivery' else ''),
+                                  callback_data=f'sr:delivery:{token}:0'),
+             InlineKeyboardButton('💰 Цена' + (' ✓' if mode == 'price' else ''),
+                                  callback_data=f'sr:price:{token}:0')]]
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton('◀️ Назад', callback_data=f'sr:page:{token}:{page-1}'))
+    navigation.append(InlineKeyboardButton(f'{page+1}/{pages}', callback_data=f'sr:page:{token}:{page}'))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton('Вперёд ▶️', callback_data=f'sr:page:{token}:{page+1}'))
+    rows.append(navigation)
+    if screen:
+        rows.append([InlineKeyboardButton('📺 Выбрать диагональ', callback_data=f'sr:diags:{token}:0')])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _send_search_blocks(message, header, offers, rate, offset=0, keyboard=None):
@@ -1585,43 +1668,98 @@ async def run_search(message, query_text, context):
     if not query_text:
         await message.reply_text('Напиши название товара для поиска.')
         return
-    interpreted = _interpret_search_query(query_text)
-    requested = parse_product(interpreted)
-    anchor = _search_prefilter_anchor(query_text, requested)
-    matches = [o for o in search_offers(anchor)
-               if _offer_matches(query_text, requested, o)]
+    category = _screen_category(query_text)
+    diagonal = None
+    if category:
+        diagonal, terms = _screen_query_parts(query_text, category)
+        anchor = 'телевиз' if category == 'tv' else 'монитор'
+        matches = [o for o in search_offers(anchor) if _screen_offer_matches(o, category, terms)]
+    else:
+        interpreted = _interpret_search_query(query_text)
+        requested = parse_product(interpreted)
+        anchor = _search_prefilter_anchor(query_text, requested)
+        matches = [o for o in search_offers(anchor)
+                   if _offer_matches(query_text, requested, o)]
     if not matches:
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
         return
     rate = get_usd_byn_rate()
     token = int(time.time_ns() % 1000000000000)
-    context.user_data['search_result_snapshot'] = {
+    snapshot = {
         'token': token, 'query': query_text, 'all': matches, 'rate': rate,
+        'category': category, 'diagonal': diagonal, 'mode': 'price',
     }
-    await message.reply_text(
-        f'🔎 {query_text}\nНайдено предложений: {len(matches)}\n'
-        'Как отсортировать результаты?',
-        reply_markup=_sort_choice_keyboard(token),
-    )
+    context.user_data['search_result_snapshot'] = snapshot
+    if category and diagonal is None:
+        await message.reply_text(
+            f'🔎 {query_text}\nНайдено предложений: {len(matches)}\nВыбери диагональ:',
+            reply_markup=_screen_diagonal_keyboard(token, matches),
+        )
+    else:
+        await _show_search_page(message, snapshot, 0)
+
+
+def _filtered_search_offers(snapshot):
+    matches = snapshot['all']
+    chosen = snapshot.get('diagonal')
+    if chosen == 'any' or chosen is None:
+        return matches
+    actual = None if chosen == 'unknown' else chosen
+    return [o for o in matches if _screen_diagonal(o['original_name'], snapshot['category']) == actual]
+
+
+async def _show_search_page(message, snapshot, page):
+    rate = snapshot['rate']
+    ordered = sorted(_filtered_search_offers(snapshot),
+                     key=lambda o: _offer_sort_key(o, rate, snapshot['mode']))
+    pages = max(1, (len(ordered) + SCREEN_PAGE_SIZE - 1) // SCREEN_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * SCREEN_PAGE_SIZE
+    mode_label = 'сроку доставки' if snapshot['mode'] == 'delivery' else 'цене'
+    d = snapshot.get('diagonal')
+    diagonal_label = (f'\nДиагональ: {d}″' if isinstance(d, int) else
+                      '\nДиагональ: не определена' if d == 'unknown' else '')
+    header = (f"🔎 {snapshot['query']}{diagonal_label}\n"
+              f"Найдено предложений: {len(ordered)}\n"
+              f"Страница {page+1}/{pages} · Сортировка: по {mode_label}\n"
+              f"💱 1 USD = {rate} BYN")
+    await _send_search_blocks(message, header, ordered[start:start+SCREEN_PAGE_SIZE], rate,
+                              offset=start, keyboard=_search_nav_keyboard(
+                                  snapshot['token'], page, pages, snapshot['mode'], bool(snapshot['category'])))
 
 
 async def search_results_callback(query, context, action):
     parts = action.split(':')
     snapshot = context.user_data.get('search_result_snapshot')
-    if (len(parts) != 4 or not snapshot or
-            parts[2] != str(snapshot['token'])):
+    if (len(parts) != 4 or not snapshot or parts[2] != str(snapshot['token'])):
         await query.message.reply_text('Результаты этого поиска устарели. Повтори запрос.')
         return
     mode = parts[1]
-    if mode not in ('delivery', 'price'):
+    if mode == 'diags' and snapshot.get('category'):
+        await query.message.reply_text(
+            f"🔎 {snapshot['query']}\nВыбери диагональ:",
+            reply_markup=_screen_diagonal_keyboard(snapshot['token'], snapshot['all'], snapshot['diagonal']),
+        )
         return
-    rate = snapshot['rate']
-    ordered = sorted(snapshot['all'], key=lambda offer: _offer_sort_key(offer, rate, mode))
-    mode_label = 'сроку доставки' if mode == 'delivery' else 'цене'
-    header = (f"🔎 {snapshot['query']}\nНайдено предложений: {len(ordered)}\n"
-              f"Сортировка: по {mode_label}\n💱 1 USD = {rate} BYN")
-    await _send_search_blocks(query.message, header, ordered, rate,
-                              keyboard=_sort_choice_keyboard(snapshot['token']))
+    if mode == 'diag' and snapshot.get('category'):
+        raw = parts[3]
+        valid = {str(d) for d in SCREEN_DIAGONALS[snapshot['category']]}
+        if raw not in valid | {'any', 'unknown'}:
+            return
+        snapshot['diagonal'] = int(raw) if raw.isdigit() else raw
+        await _show_search_page(query.message, snapshot, 0)
+        return
+    if mode in ('delivery', 'price'):
+        snapshot['mode'] = mode
+        page = 0
+    elif mode == 'page':
+        try:
+            page = max(0, int(parts[3]))
+        except ValueError:
+            return
+    else:
+        return
+    await _show_search_page(query.message, snapshot, page)
 
 
 async def cancelrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
