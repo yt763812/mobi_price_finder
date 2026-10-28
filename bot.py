@@ -6,6 +6,8 @@ import re
 import hashlib
 import asyncio
 from io import BytesIO
+from pathlib import Path
+from large_csv_importer import import_large_csv, MAX_CSV_BYTES
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta
 import time
@@ -1296,10 +1298,63 @@ async def _finish_excel_album(context, message, key):
             return
 
 
+_csv_import_lock = asyncio.Lock()
+
+
+async def handle_large_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Use a path provided by a co-located local Bot API; never buffer 350 MB."""
+    if not await authorize(update):
+        return
+    message = update.effective_message
+    document = message.document
+    sid = context.user_data.get('supplier_id')
+    supplier = get_supplier(sid) if sid else None
+    if not supplier:
+        await message.reply_text('Сначала выбери поставщика через /suppliers.')
+        return
+    if context.user_data.get('auto_draft') or context.user_data.get('parts') or context.user_data.get('excel_album'):
+        await message.reply_text('Сначала заверши предыдущую загрузку прайса.')
+        return
+    if supplier['currency'] != 'BYN' or supplier['tax_status'] not in ('with_vat', 'without_vat'):
+        await message.reply_text('CSV с розничной ценой в BYN: выбери для поставщика валюту BYN и НДС в /settings.')
+        return
+    if document.file_size and document.file_size > MAX_CSV_BYTES:
+        await message.reply_text('CSV превышает установленный предел MAX_CSV_BYTES.')
+        return
+    if not os.getenv('TELEGRAM_LOCAL_API_URL'):
+        await message.reply_text('Большой CSV требует локального Telegram Bot API (TELEGRAM_LOCAL_API_URL).')
+        return
+    if _csv_import_lock.locked():
+        await message.reply_text('Сейчас выполняется другой CSV-импорт. Повтори позже.')
+        return
+    async with _csv_import_lock:
+        status = await message.reply_text('📥 CSV принят. Получаю файл и импортирую в БД. Старые цены сохранятся при ошибке.')
+        try:
+            tg_file = await document.get_file(read_timeout=120)
+            file_path = Path(tg_file.file_path or '')
+            if not file_path.is_absolute() or not file_path.is_file():
+                raise ValueError('Локальный Bot API не предоставил путь к файлу. Проверь совместный контейнер и --local.')
+            # Local API returns a path inside its storage directory.
+            root = Path(os.getenv('TELEGRAM_API_FILES_ROOT', '/data/bot-api')).resolve()
+            if not file_path.resolve().is_relative_to(root):
+                raise ValueError('Небезопасный путь файла от Bot API.')
+            result = await asyncio.to_thread(import_large_csv, file_path, sid, supplier['tax_status'])
+            await status.edit_text('✅ CSV загружен для выбранного поставщика.\n'
+                f'Строк: {result["total"]:,}\nСохранено: {result["saved"]:,}\n'
+                f'Пропущено: {result["skipped"]:,}\nДубликаты: {result["duplicates"]:,}\n'
+                'Цена: «Розничная цена», BYN.')
+        except Exception as exc:
+            logger.exception('Large CSV import failed')
+            await status.edit_text('❌ CSV не импортирован, старый прайс сохранён.\n' + str(exc)[:350])
+
+
 async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
     message = update.effective_message
+    if message.document and (message.document.file_name or '').lower().endswith('.csv'):
+        await handle_large_csv(update, context)
+        return
     if context.user_data.get('auto_draft'):
         await message.reply_text('Сначала сохрани или отмени текстовый черновик.', reply_markup=auto_draft_keyboard(context.user_data['auto_draft']))
         return
@@ -1815,7 +1870,12 @@ def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
-    app = ApplicationBuilder().token(token).post_init(combined_post_init).build()
+    builder = ApplicationBuilder().token(token).post_init(combined_post_init)
+    local_api = os.getenv('TELEGRAM_LOCAL_API_URL', '').rstrip('/')
+    if local_api:
+        builder = (builder.base_url(local_api + '/bot')
+                   .base_file_url(local_api + '/file/bot').local_mode(True))
+    app = builder.build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
