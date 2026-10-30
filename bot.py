@@ -1780,12 +1780,30 @@ async def run_search(message, query_text, context):
         requested = parse_product(interpreted)
         anchor = _search_prefilter_anchor(query_text, requested)
         model = requested.get('model') or ''
-        # Use the structured model index and a selective name fallback for
-        # queries such as "iPhone 17 Pro Max". Matching itself is unchanged.
-        iphone_pro_max = re.fullmatch(r'iPhone (\d{1,2}) Pro Max', model)
-        if iphone_pro_max:
-            candidates = search_offers(model=model,
-                                       name_terms=(iphone_pro_max.group(1), 'pro', 'max'))
+        # All recognized iPhone generations use the indexed model column.
+        # Unknown/abbreviated supplier names are also considered by requiring
+        # both generation and storage where specified. Python validates the
+        # complete model, capacity and color afterwards.
+        iphone = re.fullmatch(
+            r'iPhone (\d{1,2})(?: (Pro Max|Pro|Plus|Mini|Air))?', model, re.I
+        )
+        if iphone:
+            generation = iphone.group(1)
+            variant = iphone.group(2)
+            storage = requested.get('storage_gb')
+            if variant:
+                # Pro Max previously had this optimized path; extend it to
+                # other iPhone variants without requiring supplier branding.
+                variant_terms = ('pro', 'max') if variant.casefold() == 'pro max' else (variant.casefold(),)
+                name_terms = (generation, *variant_terms)
+            elif storage is not None:
+                # Generation alone matches far too many catalogue entries.
+                # Storage is required by the final matcher, so using it as a
+                # prefilter cannot discard a valid textual match.
+                name_terms = (generation, str(storage))
+            else:
+                name_terms = (generation, 'iphone')
+            candidates = search_offers(model=model, name_terms=name_terms)
         else:
             candidates = search_offers(anchor)
         matches = [o for o in candidates
