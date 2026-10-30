@@ -5,6 +5,7 @@ import os
 import re
 import hashlib
 import asyncio
+import contextvars
 import tempfile
 from io import BytesIO
 from pathlib import Path
@@ -341,6 +342,62 @@ def keyboard_suppliers():
                for s in list_suppliers()[:75]]
     buttons.append([InlineKeyboardButton("➕ Новый поставщик", callback_data="supplier:new")])
     return InlineKeyboardMarkup(buttons)
+
+
+# Keep track of messages created during each update, including multi-message searches.
+_active_cleanup = contextvars.ContextVar('pricefinder_cleanup', default=None)
+_original_reply_text = None
+
+
+def _install_message_tracking():
+    global _original_reply_text
+    from telegram import Message
+    if _original_reply_text is not None:
+        return
+    _original_reply_text = Message.reply_text
+
+    async def tracked_reply_text(self, *args, **kwargs):
+        sent = await _original_reply_text(self, *args, **kwargs)
+        active = _active_cleanup.get()
+        if active is not None:
+            active.append((sent.chat_id, sent.message_id))
+        return sent
+
+    Message.reply_text = tracked_reply_text
+
+
+async def _cleanup_before(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    _active_cleanup.set([])
+
+
+async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    new_messages = _active_cleanup.get() or []
+    _active_cleanup.set(None)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+    previous = context.chat_data.get('cleanup_messages', [])
+    menu_ref = context.user_data.get('main_menu_message')
+    menu_id = menu_ref[1] if menu_ref and menu_ref[0] == chat_id else None
+    # Keep every message belonging to the current answer (pagination can span messages).
+    current_ids = {mid for cid, mid in new_messages if cid == chat_id}
+    if not current_ids and update.callback_query:
+        current_ids.add(update.callback_query.message.message_id)
+    protected = current_ids | ({menu_id} if menu_id is not None else set())
+    candidates = set(previous)
+    incoming = update.effective_message
+    if incoming and not update.callback_query:
+        candidates.add(incoming.message_id)
+    for mid in sorted(candidates - protected):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except TelegramError:
+            pass  # Telegram restricts deletion (e.g. messages older than 48h).
+    context.chat_data['cleanup_messages'] = sorted(protected)
 
 
 async def _clean_navigation(message, context, text, reply_markup=None, *, main_menu=False):
@@ -1992,6 +2049,9 @@ def main():
         builder = (builder.base_url(local_api + '/bot')
                    .base_file_url(local_api + '/file/bot').local_mode(True))
     app = builder.build()
+    _install_message_tracking()
+    app.add_handler(MessageHandler(filters.ALL, _cleanup_before, block=True), group=-1)
+    app.add_handler(CallbackQueryHandler(_cleanup_before, block=True), group=-1)
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
@@ -2002,6 +2062,8 @@ def main():
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.ALL, _cleanup_after), group=1)
+    app.add_handler(CallbackQueryHandler(_cleanup_after), group=1)
     app.add_error_handler(on_error)
     logger.info('Mobi Price Finder запущен')
     app.run_polling()
