@@ -380,6 +380,10 @@ async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is None:
         return
+    # Telegram sends an album as separate document updates. Never delete its
+    # messages or confirmation UI while the batch is being assembled/reviewed.
+    if (update.effective_message and update.effective_message.document) or context.user_data.get('excel_album') or context.user_data.get('excel_pending'):
+        return
     previous = context.chat_data.get('cleanup_messages', [])
     menu_ref = context.user_data.get('main_menu_message')
     menu_id = menu_ref[1] if menu_ref and menu_ref[0] == chat_id else None
