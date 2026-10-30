@@ -1,19 +1,18 @@
-# Builds Telegram's official local Bot API and runs it with the existing Python bot.
-FROM debian:bookworm AS api-build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git cmake g++ make gperf zlib1g-dev libssl-dev && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --recursive https://github.com/tdlib/telegram-bot-api.git /src
-WORKDIR /src/build
-RUN cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . --target telegram-bot-api -j 2
 
-FROM python:3.11-slim-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends libssl3 zlib1g ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=api-build /src/build/telegram-bot-api /usr/local/bin/telegram-bot-api
+# Use prebuilt Telegram Bot API from GitHub Container Registry
+FROM ghcr.io/yt763812/mobi-telegram-api-base:stable
+
 WORKDIR /app
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
-RUN chmod +x run_local_bot_api.sh start_with_local_api.sh && mkdir -p /data/bot-api
+
+RUN chmod +x run_local_bot_api.sh start_with_local_api.sh \
+    && mkdir -p /data/bot-api
+
 ENV TELEGRAM_LOCAL_API_URL=http://127.0.0.1:8081
 ENV TELEGRAM_API_FILES_ROOT=/data/bot-api
+
 CMD ["./start_with_local_api.sh"]
