@@ -383,12 +383,16 @@ async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
     previous = context.chat_data.get('cleanup_messages', [])
     menu_ref = context.user_data.get('main_menu_message')
     menu_id = menu_ref[1] if menu_ref and menu_ref[0] == chat_id else None
-    # Keep every message belonging to the current answer (pagination can span messages).
-    current_ids = {mid for cid, mid in new_messages if cid == chat_id}
-    if not current_ids and update.callback_query:
-        current_ids.add(update.callback_query.message.message_id)
-    protected = current_ids | ({menu_id} if menu_id is not None else set())
-    candidates = set(previous)
+    # Keep only the latest response and the persistent main menu.
+    current_ids = [mid for cid, mid in new_messages if cid == chat_id]
+    latest_id = current_ids[-1] if current_ids else None
+    # Edited callback messages remain the current screen when no new message was sent.
+    if latest_id is None and update.callback_query:
+        latest_id = update.callback_query.message.message_id
+    protected = ({latest_id} if latest_id is not None else set()) | ({menu_id} if menu_id is not None else set())
+    candidates = set(previous) | set(current_ids)
+    if update.callback_query:
+        candidates.add(update.callback_query.message.message_id)
     incoming = update.effective_message
     if incoming and not update.callback_query:
         candidates.add(incoming.message_id)
