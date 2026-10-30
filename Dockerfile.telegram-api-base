@@ -1,0 +1,17 @@
+# Build the official Telegram Bot API only when this base Dockerfile changes.
+FROM debian:bookworm AS api-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git cmake g++ make gperf zlib1g-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --recursive https://github.com/tdlib/telegram-bot-api.git /src
+WORKDIR /src/build
+RUN cmake -DCMAKE_BUILD_TYPE=Release .. \
+    && cmake --build . --target telegram-bot-api -j 2
+
+FROM python:3.11-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 zlib1g ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=api-build /src/build/telegram-bot-api /usr/local/bin/telegram-bot-api
+WORKDIR /app
+RUN mkdir -p /data/bot-api
