@@ -385,6 +385,7 @@ async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (update.effective_message and update.effective_message.document) or context.user_data.get('excel_album') or context.user_data.get('excel_pending'):
         return
     previous = context.chat_data.get('cleanup_messages', [])
+    uploaded = context.chat_data.pop('uploaded_price_messages', [])
     menu_ref = context.user_data.get('main_menu_message')
     menu_id = menu_ref[1] if menu_ref and menu_ref[0] == chat_id else None
     # Keep only the latest response and the persistent main menu.
@@ -394,7 +395,7 @@ async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if latest_id is None and update.callback_query:
         latest_id = update.callback_query.message.message_id
     protected = ({latest_id} if latest_id is not None else set()) | ({menu_id} if menu_id is not None else set())
-    candidates = set(previous) | set(current_ids)
+    candidates = set(previous) | set(current_ids) | set(uploaded)
     if update.callback_query:
         candidates.add(update.callback_query.message.message_id)
     incoming = update.effective_message
@@ -1511,6 +1512,8 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if supplier['currency'] not in ('USD', 'BYN', 'RUB', 'EUR') or supplier['tax_status'] not in ('with_vat', 'without_vat'):
         await message.reply_text('Сначала укажи валюту и НДС в /settings.')
         return
+    # Keep every document message until the complete batch has been saved or cancelled.
+    context.chat_data.setdefault('uploaded_price_messages', []).append(message.message_id)
     album_id = message.media_group_id
     key = f'{message.chat_id}:{album_id}' if album_id else None
     draft = context.user_data.get('excel_album')
