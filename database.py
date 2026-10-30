@@ -444,7 +444,7 @@ def search_offers(anchor=None, *, model=None, name_terms=None):
     """Search fresh offers using index-friendly SQL before Python validation.
 
     For recognized iPhones, exact structured model matches are retained along
-    with supplier names carrying the generation and variant tokens. The final
+    with supplier names carrying generation and distinguishing tokens. The final
     Python product parser remains the authority on model, capacity and color.
     Other searches retain the original conservative anchor behavior.
     """
