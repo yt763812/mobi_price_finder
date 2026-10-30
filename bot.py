@@ -5,6 +5,7 @@ import os
 import re
 import hashlib
 import asyncio
+import tempfile
 from io import BytesIO
 from pathlib import Path
 from large_csv_importer import import_large_csv, MAX_CSV_BYTES
@@ -26,7 +27,7 @@ import a1_bot_integration
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
-    get_excel_profiles, save_excel_profiles, export_supplier_offers,
+    get_excel_profiles, save_excel_profiles, export_supplier_offers, iter_supplier_offers,
     get_usd_byn_rate, set_usd_byn_rate, set_supplier_delivery_days,
 )
 from product_parser import parse_product, section_brand, contextual_name
@@ -659,16 +660,23 @@ def _audit_cell(value):
     return value
 
 
-def _build_supplier_export(supplier, offers):
-    """Build an XLSX audit of DB state, including parsed view and raw fields."""
+# XLSX limit: 1,048,576 rows per sheet, including header.
+_XLSX_DATA_ROWS_PER_SHEET = 1_048_575
+_supplier_export_lock = asyncio.Lock()
+
+
+def _build_supplier_export(supplier, offers, path):
+    """Write an Excel audit directly to disk with bounded RAM usage.
+
+    The caller supplies a streaming iterator of database records. Both sheets
+    split at Excel's row limit; original column order and audit rules remain.
+    """
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
-    workbook = Workbook()
-    all_sheet = workbook.active
-    all_sheet.title = 'Все товары'
-    check_sheet = workbook.create_sheet('Проверка')
+    workbook = Workbook(write_only=True)
     headers = [
         'ID записи', 'Исходное название (БД)', 'Модель в поиске', 'Бренд',
         'Память, GB', 'RAM, GB', 'Цвет', 'Регион', 'SIM', 'Состояние',
@@ -677,10 +685,53 @@ def _build_supplier_export(supplier, offers):
         'SIM сохранён в БД', 'Предупреждения БД',
     ]
     check_headers = ['ID записи', 'Исходное название', 'Причина проверки', 'Цена', 'Валюта']
-    all_sheet.append(headers)
-    check_sheet.append(check_headers)
+    all_widths = [13, 70, 29, 17, 15, 14, 22, 21, 18, 20, 16, 13, 16, 22, 12, 29, 22, 21, 18, 50]
+    check_widths = [13, 75, 65, 16, 14]
+    header_fill = PatternFill('solid', fgColor='17365D')
+    header_font = Font(color='FFFFFF', bold=True)
+    header_alignment = Alignment(vertical='center', wrap_text=True)
+    price_format = '#,##0.00'
+
+    def create_sheet(base, number, headings, widths, price_column):
+        title = base if number == 1 else f'{base} {number}'
+        sheet = workbook.create_sheet(title)
+        sheet.freeze_panes = 'C2' if base == 'Все товары' else 'B2'
+        sheet.auto_filter.ref = f'A1:{get_column_letter(len(headings))}{_XLSX_DATA_ROWS_PER_SHEET + 1}'
+        for idx, width in enumerate(widths, 1):
+            sheet.column_dimensions[get_column_letter(idx)].width = width
+        cells = []
+        for heading in headings:
+            cell = WriteOnlyCell(sheet, value=heading)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+            cells.append(cell)
+        sheet.append(cells)
+        return sheet
+
+    all_number = check_number = 1
+    all_sheet = create_sheet('Все товары', all_number, headers, all_widths, 11)
+    check_sheet = create_sheet('Проверка', check_number, check_headers, check_widths, 4)
+    total = review_count = 0
     vat_labels = {'with_vat': 'С НДС', 'without_vat': 'Без НДС', 'unknown': 'Не указан'}
+    condition_labels = {'activated': 'Активирован', 'sealed': 'Запечатан',
+                        'refurbished': 'Восстановлен', 'used': 'Б/у'}
+
+    def format_row(sheet, values, price_col, date_col=None):
+        # Create styled cells only for columns that need a number format.
+        values = list(values)
+        for index, number_format in ((price_col - 1, price_format),
+                                      (date_col - 1, 'DD.MM.YYYY HH:MM') if date_col else (-1, '')):
+            if index >= 0 and values[index] is not None:
+                cell = WriteOnlyCell(sheet, value=values[index])
+                cell.number_format = number_format
+                values[index] = cell
+        sheet.append(values)
+
     for offer in offers:
+        if total and total % _XLSX_DATA_ROWS_PER_SHEET == 0:
+            all_number += 1
+            all_sheet = create_sheet('Все товары', all_number, headers, all_widths, 11)
         parsed = parse_product(offer['original_name'])
         def effective(key):
             value = parsed.get(key)
@@ -688,8 +739,6 @@ def _build_supplier_export(supplier, offers):
         conditions = parsed.get('condition') or offer.get('condition_tags') or []
         if isinstance(conditions, str):
             conditions = [conditions]
-        condition_labels = {'activated': 'Активирован', 'sealed': 'Запечатан',
-                            'refurbished': 'Восстановлен', 'used': 'Б/у'}
         status = ', '.join(condition_labels.get(str(c), str(c)) for c in conditions) or 'Не указано'
         date = offer.get('updated_at')
         if date and date.tzinfo:
@@ -706,7 +755,10 @@ def _build_supplier_export(supplier, offers):
             _audit_cell(offer.get('region')), _audit_cell(offer.get('sim')),
             '; '.join(str(x) for x in (offer.get('warnings') or [])),
         ]
-        all_sheet.append(row)
+        format_row(all_sheet, row, 11, 14)
+        total += 1
+        if total % 100000 == 0:
+            logger.info('Excel export: %s rows written for supplier %s', total, supplier['id'])
         reasons = []
         if not effective('model'):
             reasons.append('Модель не распознана')
@@ -720,34 +772,17 @@ def _build_supplier_export(supplier, offers):
             reasons.append('Модель из текста отличается от сохранённой')
         reasons += [str(w) for w in (offer.get('warnings') or [])]
         if reasons:
-            check_sheet.append([offer['id'], _audit_cell(offer['original_name']),
-                                '; '.join(reasons), price, offer.get('currency')])
+            if review_count and review_count % _XLSX_DATA_ROWS_PER_SHEET == 0:
+                check_number += 1
+                check_sheet = create_sheet('Проверка', check_number, check_headers, check_widths, 4)
+            format_row(check_sheet, [offer['id'], _audit_cell(offer['original_name']),
+                                     '; '.join(reasons), price, offer.get('currency')], 4)
+            review_count += 1
 
-    for sheet, widths, price_col in [
-        (all_sheet, [13, 70, 29, 17, 15, 14, 22, 21, 18, 20, 16, 13, 16, 22, 12, 29, 22, 21, 18, 50], 11),
-        (check_sheet, [13, 75, 65, 16, 14], 4),
-    ]:
-        sheet.freeze_panes = 'C2' if sheet is all_sheet else 'B2'
-        sheet.auto_filter.ref = sheet.dimensions
-        sheet.row_dimensions[1].height = 28
-        for cell in sheet[1]:
-            cell.fill = PatternFill('solid', fgColor='17365D')
-            cell.font = Font(color='FFFFFF', bold=True)
-            cell.alignment = Alignment(vertical='center', wrap_text=True)
-        for col, width in enumerate(widths, 1):
-            sheet.column_dimensions[get_column_letter(col)].width = width
-        for row in sheet.iter_rows(min_row=2):
-            if row[0].row % 2 == 0:
-                for cell in row:
-                    cell.fill = PatternFill('solid', fgColor='F1F6FA')
-            row[price_col - 1].number_format = '#,##0.00'
-        if sheet is all_sheet:
-            for cell in sheet['N'][1:]:
-                cell.number_format = 'DD.MM.YYYY HH:MM'
-    data = BytesIO()
-    workbook.save(data)
-    data.seek(0)
-    return data, check_sheet.max_row - 1
+    if total:
+        workbook.save(path)
+    workbook.close()
+    return total, review_count
 
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -938,23 +973,34 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
             return
         if operation == 'export':
-            try:
-                offers = export_supplier_offers(sid)
-                if not offers:
-                    await query.message.reply_text('У этого поставщика пока нет сохранённых товаров.')
-                    return
-                file_buffer, review_count = _build_supplier_export(s, offers)
-                file_name = f'pricefinder_supplier_{sid}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
-                await query.message.reply_document(
-                    document=file_buffer, filename=file_name,
-                    caption=(f'📥 Выгрузка из PostgreSQL: {s["name"]}\n'
-                             f'Товаров: {len(offers)}\n'
-                             f'Позиций для проверки: {review_count}\n'
-                             'Показаны все сохранённые товары, включая устаревшие.'),
-                )
-            except Exception:
-                logger.exception('Failed to export supplier %s', sid)
-                await query.message.reply_text('Не удалось выгрузить прайс. Проверь логи Railway.')
+            if _supplier_export_lock.locked():
+                await query.message.reply_text('⏳ Другая выгрузка Excel уже выполняется. Повтори позже.')
+                return
+            async with _supplier_export_lock:
+                await query.message.reply_text('📦 Формирую Excel. Для большого прайса это может занять несколько минут.')
+                try:
+                    with tempfile.TemporaryDirectory(prefix='pricefinder_export_') as folder:
+                        file_name = f'pricefinder_supplier_{sid}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
+                        path = os.path.join(folder, file_name)
+                        total, review_count = await asyncio.to_thread(
+                            _build_supplier_export, s, iter_supplier_offers(sid), path)
+                        if not total:
+                            await query.message.reply_text('У этого поставщика пока нет сохранённых товаров.')
+                            return
+                        logger.info('Excel export: ready supplier=%s rows=%s review=%s size=%s',
+                                    sid, total, review_count, os.path.getsize(path))
+                        with open(path, 'rb') as document:
+                            await query.message.reply_document(
+                                document=document, filename=file_name,
+                                read_timeout=600, write_timeout=600,
+                                caption=(f'📥 Выгрузка из PostgreSQL: {s["name"]}\n'
+                                         f'Товаров: {total}\n'
+                                         f'Позиций для проверки: {review_count}\n'
+                                         'Показаны все сохранённые товары, включая устаревшие.'),
+                            )
+                except Exception:
+                    logger.exception('Failed to export supplier %s', sid)
+                    await query.message.reply_text('Не удалось выгрузить прайс. Проверь логи Railway.')
         elif operation == 'rename':
             context.user_data.pop('await_name', None)
             context.user_data['await_rename_id'] = sid
