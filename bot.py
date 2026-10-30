@@ -370,6 +370,19 @@ async def _cleanup_before(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     _active_cleanup.set([])
+    # Ensure a persistent, clickable main menu exists before the handler sends
+    # its response. /start and /menu create their own menu below.
+    chat = update.effective_chat
+    if chat and not (update.message and update.message.text in ('/start', '/menu', '/mode')):
+        ref = context.user_data.get('main_menu_message')
+        if not ref or ref[0] != chat.id:
+            try:
+                sent = await context.bot.send_message(
+                    chat_id=chat.id, text='🏠 Главное меню', reply_markup=mode_keyboard(),
+                )
+                context.user_data['main_menu_message'] = (chat.id, sent.message_id)
+            except TelegramError:
+                logger.exception('Could not create persistent main menu')
 
 
 async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,16 +483,11 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
-    await update.effective_message.reply_text(
-        "👋 Mobi Price Finder\n\n/suppliers — выбрать/добавить поставщика\n"
-        "/settings — валюта и НДС выбранного поставщика\n"
-        "/prices — сохранённые цены выбранного поставщика\n"
-        "/find iPhone 17 Pro 256GB Black — сравнить поставщиков\n"
-        "/menu — меню и режим работы\n"
-        "Просто напиши название товара — бот выполнит поиск.\n"
-        "Прайсы с ценами бот предложит сохранить.\n"
-        "Для длинного текстового прайса выбери 📚 Прайс частями.",
-        reply_markup=mode_keyboard(),
+    await _clean_navigation(
+        update.effective_message, context,
+        "👋 Mobi Price Finder\n\nВыбирай нужный раздел кнопками ниже. "
+        "Для поиска просто напиши название товара.",
+        reply_markup=mode_keyboard(), main_menu=True,
     )
 
 
