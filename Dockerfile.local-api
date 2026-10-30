@@ -15,4 +15,4 @@ RUN chmod +x run_local_bot_api.sh start_with_local_api.sh \
 ENV TELEGRAM_LOCAL_API_URL=http://127.0.0.1:8081
 ENV TELEGRAM_API_FILES_ROOT=/data/bot-api
 
-CMD ["./start_with_local_api.sh"]
+CMD ["/bin/sh", "./start_with_local_api.sh"]
