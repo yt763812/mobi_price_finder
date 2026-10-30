@@ -1804,6 +1804,18 @@ async def run_search(message, query_text, context):
             else:
                 name_terms = (generation, 'iphone')
             candidates = search_offers(model=model, name_terms=name_terms)
+        elif model:
+            # A single generation number (e.g. "11" or "15") is far too
+            # broad for a million-row catalogue. Use the structured model
+            # index plus a two-part supplier-name fallback. A textual part
+            # of 4+ characters keeps the trigram index useful.
+            model_tokens = re.findall(r'[a-zа-яё0-9]+', model.casefold())
+            distinctive = [t for t in model_tokens if len(t) >= 4 and t not in {'with', 'plus'}]
+            number_tokens = [t for t in model_tokens if any(c.isdigit() for c in t)]
+            if distinctive and number_tokens:
+                candidates = search_offers(model=model, name_terms=(distinctive[0], number_tokens[0]))
+            else:
+                candidates = search_offers(anchor)
         else:
             candidates = search_offers(anchor)
         matches = [o for o in candidates
