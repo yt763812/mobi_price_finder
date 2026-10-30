@@ -1779,7 +1779,16 @@ async def run_search(message, query_text, context):
         interpreted = _interpret_search_query(query_text)
         requested = parse_product(interpreted)
         anchor = _search_prefilter_anchor(query_text, requested)
-        matches = [o for o in search_offers(anchor)
+        model = requested.get('model') or ''
+        # Use the structured model index and a selective name fallback for
+        # queries such as "iPhone 17 Pro Max". Matching itself is unchanged.
+        iphone_pro_max = re.fullmatch(r'iPhone (\d{1,2}) Pro Max', model)
+        if iphone_pro_max:
+            candidates = search_offers(model=model,
+                                       name_terms=(iphone_pro_max.group(1), 'pro', 'max'))
+        else:
+            candidates = search_offers(anchor)
+        matches = [o for o in candidates
                    if _offer_matches(query_text, requested, o)]
     if not matches:
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
