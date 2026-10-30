@@ -440,35 +440,44 @@ def save_excel_rows(supplier_id, rows, currency, tax_status):
     return _replace_supplier_offers(supplier_id, rows, currency, tax_status)
 
 
-def search_offers(anchor=None):
-    """Return current offers narrowed by a conservative name/model fragment.
+def search_offers(anchor=None, *, model=None, name_terms=None):
+    """Search fresh offers using index-friendly SQL before Python validation.
 
-    An anchor is a broad prefilter, not a replacement for the precise Python
-    match (which handles models, variants, and accessories). The parameter is
-    optional so existing callers retain their previous behavior.
+    For recognized iPhones, exact structured model matches are retained along
+    with supplier names carrying the generation and variant tokens. The final
+    Python product parser remains the authority on model, capacity and color.
+    Other searches retain the original conservative anchor behavior.
     """
+    def escape_like(value):
+        return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
     with _connect() as conn:
         with conn.cursor() as cur:
-            if anchor:
-                # Escape LIKE wildcards: an anchor is literal user text.
-                escaped = anchor.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-                pattern = '%' + escaped + '%'
-                cur.execute("""
-                    SELECT o.*, s.name AS supplier_name, s.delivery_workdays,
-                        TRUE AS is_fresh
-                    FROM offers o JOIN suppliers s ON s.id=o.supplier_id
-                    WHERE o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour'
-                      AND (o.original_name ILIKE %s ESCAPE '\\'
-                           OR o.model ILIKE %s ESCAPE '\\'
-                           OR o.brand ILIKE %s ESCAPE '\\')
-                """, (pattern, pattern, pattern))
+            conditions = []
+            params = []
+            if model and name_terms:
+                # Indexed equality on model, plus a trigram-indexable fallback
+                # for descriptions that the importer could not categorize.
+                name_checks = []
+                for term in name_terms:
+                    name_checks.append("o.original_name ILIKE %s ESCAPE '\\'")
+                conditions.append('(' + ' AND '.join(name_checks) + ')')
+                params.extend('%' + escape_like(term) + '%' for term in name_terms)
+                filter_sql = '(o.model = %s OR ' + conditions[0] + ')'
+                params = [model, *params]
+            elif anchor:
+                pattern = '%' + escape_like(anchor) + '%'
+                filter_sql = "(o.original_name ILIKE %s ESCAPE '\\' OR o.model ILIKE %s ESCAPE '\\' OR o.brand ILIKE %s ESCAPE '\\')"
+                params = [pattern, pattern, pattern]
             else:
-                cur.execute("""
-                    SELECT o.*, s.name AS supplier_name, s.delivery_workdays,
-                        TRUE AS is_fresh
-                    FROM offers o JOIN suppliers s ON s.id=o.supplier_id
-                    WHERE o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour'
-                """)
+                filter_sql = 'TRUE'
+            cur.execute(f"""
+                SELECT o.*, s.name AS supplier_name, s.delivery_workdays,
+                    TRUE AS is_fresh
+                FROM offers o JOIN suppliers s ON s.id=o.supplier_id
+                WHERE o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour'
+                  AND {filter_sql}
+            """, params)
             return cur.fetchall()
 
 
