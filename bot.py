@@ -278,9 +278,9 @@ async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     current = context.user_data.get('mode', 'auto')
     labels = {'auto': 'Авто', 'search': 'Поиск', 'import': 'Загрузка прайса'}
-    await update.effective_message.reply_text(
+    await _clean_navigation(update.effective_message, context,
         f"Режим: {labels.get(current, 'Авто')}. Выбери нужный:",
-        reply_markup=mode_keyboard(),
+        reply_markup=mode_keyboard(), main_menu=True,
     )
 
 
@@ -343,12 +343,28 @@ def keyboard_suppliers():
     return InlineKeyboardMarkup(buttons)
 
 
+async def _clean_navigation(message, context, text, reply_markup=None, *, main_menu=False):
+    """Keep the current navigation screen and a separate main menu, if present."""
+    chat_id = message.chat_id
+    key = 'main_menu_message' if main_menu else 'navigation_message'
+    previous = context.user_data.get(key)
+    sent = await message.reply_text(text, reply_markup=reply_markup)
+    context.user_data[key] = (chat_id, sent.message_id)
+    if previous and previous != (chat_id, sent.message_id):
+        try:
+            await context.bot.delete_message(previous[0], previous[1])
+        except TelegramError:
+            logger.debug('Cannot delete previous navigation message %s', previous)
+    return sent
+
+
 def supplier_manage_keyboard(supplier, can_delete=True):
     sid = supplier['id']
     buttons = [[InlineKeyboardButton("✏️ Переименовать", callback_data=f"supplier:rename:{sid}")]]
     if can_delete:
         buttons.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"supplier:delete:{sid}")])
     buttons += [
+        [InlineKeyboardButton("📤 Загрузить прайс", callback_data=f"supplier:upload:{sid}")],
         [InlineKeyboardButton("📥 Выгрузить прайс (Excel)", callback_data=f"supplier:export:{sid}")],
         [InlineKeyboardButton("⚙️ Валюта, НДС и доставка", callback_data=f"supplier:settings:{sid}")],
         [InlineKeyboardButton("👥 Все поставщики", callback_data="nav:suppliers")],
@@ -366,6 +382,7 @@ def supplier_delete_keyboard(sid):
 def settings_keyboard(supplier):
     sid = supplier['id']
     buttons = [
+        [InlineKeyboardButton("📤 Загрузить прайс", callback_data=f"supplier:upload:{sid}")],
         [InlineKeyboardButton(f"Валюта: {supplier['currency']}", callback_data=f"settings:currency:{sid}")],
         [InlineKeyboardButton(f"НДС: {supplier['tax_status']}", callback_data=f"settings:vat:{sid}")],
         [InlineKeyboardButton(f"🚚 Доставка: {_delivery_label(supplier.get('delivery_workdays'))}", callback_data=f"settings:delivery:{sid}")],
@@ -403,7 +420,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def suppliers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
-    await update.effective_message.reply_text("Выбери поставщика (рядом дата последнего прайса):", reply_markup=keyboard_suppliers())
+    await _clean_navigation(update.effective_message, context, "Выбери поставщика (рядом дата последнего прайса):", reply_markup=keyboard_suppliers())
 
 
 async def addsupplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,7 +438,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not s:
         await update.effective_message.reply_text("Сначала выбери поставщика через /suppliers")
         return
-    await update.effective_message.reply_text(
+    await _clean_navigation(update.effective_message, context,
         f"⚙️ {s['name']}\nВалюта: {s['currency']}\nНДС: {s['tax_status']}\nДоставка: {_delivery_label(s.get('delivery_workdays'))}",
         reply_markup=settings_keyboard(s),
     )
@@ -911,12 +928,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             '🏦 БСБ Банк — продажа USD\n'
             f'Источник: {MYFIN_URL}')
     elif action == 'nav:suppliers':
-        await query.message.reply_text('Выбери поставщика:', reply_markup=keyboard_suppliers())
+        await _clean_navigation(query.message, context, 'Выбери поставщика:', reply_markup=keyboard_suppliers())
     elif action == 'nav:settings':
         sid = context.user_data.get('supplier_id')
         supplier = get_supplier(sid) if sid else None
         if supplier:
-            await query.message.reply_text(
+            await _clean_navigation(query.message, context,
                 f"⚙️ {supplier['name']}", reply_markup=settings_keyboard(supplier)
             )
         else:
@@ -961,7 +978,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Поставщик не найден")
             return
         context.user_data['supplier_id'] = sid
-        await query.message.reply_text(f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, allowed(update)))
+        await _clean_navigation(query.message, context, f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, allowed(update)))
         await show_pending(query.message, context)
     elif action.startswith('supplier:'):
         parts = action.split(':')
@@ -971,6 +988,18 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = get_supplier(sid)
         if not s:
             await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
+            return
+        if operation == 'upload':
+            if context.user_data.get('auto_draft') or context.user_data.get('parts') or context.user_data.get('excel_album') or context.user_data.get('excel_pending'):
+                await query.message.reply_text('Сначала заверши или отмени предыдущую загрузку прайса.')
+                return
+            context.user_data['supplier_id'] = sid
+            context.user_data['mode'] = 'import'
+            await _clean_navigation(query.message, context,
+                f'📤 Загрузка прайса для поставщика «{s["name"]}».\n\n'
+                'Отправьте файл CSV или Excel либо текстовый прайс. '
+                'Файл будет обработан для указанного поставщика.',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('↩️ К поставщику', callback_data=f'pick:{sid}')]]))
             return
         if operation == 'export':
             if _supplier_export_lock.locked():
@@ -1039,7 +1068,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
         elif operation == 'settings':
             context.user_data['supplier_id'] = sid
-            await query.message.reply_text(f"⚙️ {s['name']}", reply_markup=settings_keyboard(s))
+            await _clean_navigation(query.message, context, f"⚙️ {s['name']}", reply_markup=settings_keyboard(s))
     elif action.startswith('settings:delivery:'):
         sid = int(action.rsplit(':', 1)[1])
         supplier = get_supplier(sid)
