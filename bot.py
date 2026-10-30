@@ -978,6 +978,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Поставщик не найден")
             return
         context.user_data['supplier_id'] = sid
+        context.user_data['mode'] = 'auto'
         await _clean_navigation(query.message, context, f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, allowed(update)))
         await show_pending(query.message, context)
     elif action.startswith('supplier:'):
@@ -1126,6 +1127,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return report, selected_items, skipped
             report, selected_items, skipped = await asyncio.to_thread(_process_import)
             context.user_data.pop('excel_pending', None)
+            context.user_data['mode'] = 'auto'  # Import finished; allow normal product searches.
             try:
                 def _save_profiles():
                     profiles = [{**it, 'fingerprint': sheet_fingerprint(it.get('data', staged['data']), it['sheet'], it['header_row'], it['mapping'])} for it in selected_items]
