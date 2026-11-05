@@ -210,7 +210,7 @@ def append_to_auto_draft(context, supplier_id, incoming):
     if draft and draft['supplier_id'] != supplier_id:
         raise ValueError('Сначала сохрани или отмени черновик другого поставщика.')
     if draft is None:
-        draft = {'supplier_id': supplier_id, 'messages': [], 'revision': 0, 'rows': []}
+        draft = {'supplier_id': supplier_id, 'messages': [], 'message_ids': [], 'revision': 0, 'rows': []}
     if len(draft['messages']) >= 100 or sum(map(len, draft['messages'])) + len(incoming) > 800_000:
         raise ValueError('Достигнут лимит черновика. Сохрани его или отмени.')
     if incoming in draft['messages']:
@@ -396,6 +396,10 @@ async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Telegram sends an album as separate document updates. Never delete its
     # messages or confirmation UI while the batch is being assembled/reviewed.
     if (update.effective_message and update.effective_message.document) or context.user_data.get('excel_album') or context.user_data.get('excel_pending'):
+        return
+    # Text price drafts span multiple Telegram updates. Preserve their messages
+    # and confirmation UI until the database import has succeeded.
+    if context.user_data.get('auto_draft') or context.user_data.get('parts'):
         return
     previous = context.chat_data.get('cleanup_messages', [])
     uploaded = context.chat_data.pop('uploaded_price_messages', [])
@@ -894,6 +898,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if op == 'cancel':
             context.user_data.pop('auto_draft', None)
+            context.chat_data.setdefault('uploaded_price_messages', []).extend(draft.get('message_ids', []))
             try:
                 await context.bot.edit_message_reply_markup(
                     chat_id=draft.get('status_chat_id'), message_id=draft.get('status_message_id'),
@@ -918,6 +923,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text('❌ Ошибка сохранения. Старый прайс должен остаться без изменений. Проверь Railway Logs.')
                 return
             context.user_data.pop('auto_draft', None)
+            context.chat_data.setdefault('uploaded_price_messages', []).extend(draft.get('message_ids', []))
             try:
                 await context.bot.edit_message_reply_markup(
                     chat_id=draft.get('status_chat_id'), message_id=draft.get('status_message_id'),
@@ -1321,6 +1327,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             draft, added = append_to_auto_draft(context, sid, text)
+            if added:
+                draft.setdefault('message_ids', []).append(update.effective_message.message_id)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc), reply_markup=auto_draft_keyboard(existing_draft))
             return
@@ -1361,7 +1369,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text('Сначала выбери поставщика через /suppliers.')
             return
         try:
-            draft, _ = append_to_auto_draft(context, sid, text)
+            draft, added = append_to_auto_draft(context, sid, text)
+            if added:
+                draft.setdefault('message_ids', []).append(update.effective_message.message_id)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return
