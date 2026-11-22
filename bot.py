@@ -5,11 +5,7 @@ import os
 import re
 import hashlib
 import asyncio
-import contextvars
-import tempfile
 from io import BytesIO
-from pathlib import Path
-from large_csv_importer import import_large_csv, MAX_CSV_BYTES
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta
 import time
@@ -25,10 +21,12 @@ from telegram.ext import (
 from myfin_rate import MYFIN_URL, fetch_bsb_usd_sale
 from mts_daily_scheduler import post_init as mts_post_init
 import a1_bot_integration
+from onliner import telegram_ui as onliner_ui
+from onliner import store as onliner_store
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
-    get_excel_profiles, save_excel_profiles, export_supplier_offers, iter_supplier_offers,
+    get_excel_profiles, save_excel_profiles, export_supplier_offers,
     get_usd_byn_rate, set_usd_byn_rate, set_supplier_delivery_days,
 )
 from product_parser import parse_product, section_brand, contextual_name
@@ -210,7 +208,7 @@ def append_to_auto_draft(context, supplier_id, incoming):
     if draft and draft['supplier_id'] != supplier_id:
         raise ValueError('Сначала сохрани или отмени черновик другого поставщика.')
     if draft is None:
-        draft = {'supplier_id': supplier_id, 'messages': [], 'message_ids': [], 'revision': 0, 'rows': []}
+        draft = {'supplier_id': supplier_id, 'messages': [], 'revision': 0, 'rows': []}
     if len(draft['messages']) >= 100 or sum(map(len, draft['messages'])) + len(incoming) > 800_000:
         raise ValueError('Достигнут лимит черновика. Сохрани его или отмени.')
     if incoming in draft['messages']:
@@ -279,14 +277,16 @@ async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     current = context.user_data.get('mode', 'auto')
     labels = {'auto': 'Авто', 'search': 'Поиск', 'import': 'Загрузка прайса'}
-    await _clean_navigation(update.effective_message, context,
+    await update.effective_message.reply_text(
         f"Режим: {labels.get(current, 'Авто')}. Выбери нужный:",
-        reply_markup=mode_keyboard(), main_menu=True,
+        reply_markup=mode_keyboard(),
     )
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await mode(update, context)
+    if onliner_ui.can_launch(update):
+        await update.effective_message.reply_text("🛍 Управление ассортиментом Onlíner", reply_markup=onliner_ui.panel_keyboard())
 
 
 def _price_import_time(value, short=False):
@@ -344,110 +344,12 @@ def keyboard_suppliers():
     return InlineKeyboardMarkup(buttons)
 
 
-# Keep track of messages created during each update, including multi-message searches.
-_active_cleanup = contextvars.ContextVar('pricefinder_cleanup', default=None)
-_original_reply_text = None
-
-
-def _install_message_tracking():
-    global _original_reply_text
-    from telegram import Message
-    if _original_reply_text is not None:
-        return
-    _original_reply_text = Message.reply_text
-
-    async def tracked_reply_text(self, *args, **kwargs):
-        sent = await _original_reply_text(self, *args, **kwargs)
-        active = _active_cleanup.get()
-        if active is not None:
-            active.append((sent.chat_id, sent.message_id))
-        return sent
-
-    Message.reply_text = tracked_reply_text
-
-
-async def _cleanup_before(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    _active_cleanup.set([])
-    # Ensure a persistent, clickable main menu exists before the handler sends
-    # its response. /start and /menu create their own menu below.
-    chat = update.effective_chat
-    if chat and not (update.message and update.message.text in ('/start', '/menu', '/mode')):
-        ref = context.user_data.get('main_menu_message')
-        if not ref or ref[0] != chat.id:
-            try:
-                sent = await context.bot.send_message(
-                    chat_id=chat.id, text='🏠 Главное меню', reply_markup=mode_keyboard(),
-                )
-                context.user_data['main_menu_message'] = (chat.id, sent.message_id)
-            except TelegramError:
-                logger.exception('Could not create persistent main menu')
-
-
-async def _cleanup_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    new_messages = _active_cleanup.get() or []
-    _active_cleanup.set(None)
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return
-    # Telegram sends an album as separate document updates. Never delete its
-    # messages or confirmation UI while the batch is being assembled/reviewed.
-    if (update.effective_message and update.effective_message.document) or context.user_data.get('excel_album') or context.user_data.get('excel_pending'):
-        return
-    # Text price drafts span multiple Telegram updates. Preserve their messages
-    # and confirmation UI until the database import has succeeded.
-    if context.user_data.get('auto_draft') or context.user_data.get('parts'):
-        return
-    previous = context.chat_data.get('cleanup_messages', [])
-    uploaded = context.chat_data.pop('uploaded_price_messages', [])
-    menu_ref = context.user_data.get('main_menu_message')
-    menu_id = menu_ref[1] if menu_ref and menu_ref[0] == chat_id else None
-    # Keep only the latest response and the persistent main menu.
-    current_ids = [mid for cid, mid in new_messages if cid == chat_id]
-    latest_id = current_ids[-1] if current_ids else None
-    # Edited callback messages remain the current screen when no new message was sent.
-    if latest_id is None and update.callback_query:
-        latest_id = update.callback_query.message.message_id
-    protected = ({latest_id} if latest_id is not None else set()) | ({menu_id} if menu_id is not None else set())
-    candidates = set(previous) | set(current_ids) | set(uploaded)
-    if update.callback_query:
-        candidates.add(update.callback_query.message.message_id)
-    incoming = update.effective_message
-    if incoming and not update.callback_query:
-        candidates.add(incoming.message_id)
-    for mid in sorted(candidates - protected):
-        try:
-            await context.bot.delete_message(chat_id, mid)
-        except TelegramError:
-            pass  # Telegram restricts deletion (e.g. messages older than 48h).
-    context.chat_data['cleanup_messages'] = sorted(protected)
-
-
-async def _clean_navigation(message, context, text, reply_markup=None, *, main_menu=False):
-    """Keep the current navigation screen and a separate main menu, if present."""
-    chat_id = message.chat_id
-    key = 'main_menu_message' if main_menu else 'navigation_message'
-    previous = context.user_data.get(key)
-    sent = await message.reply_text(text, reply_markup=reply_markup)
-    context.user_data[key] = (chat_id, sent.message_id)
-    if previous and previous != (chat_id, sent.message_id):
-        try:
-            await context.bot.delete_message(previous[0], previous[1])
-        except TelegramError:
-            logger.debug('Cannot delete previous navigation message %s', previous)
-    return sent
-
-
 def supplier_manage_keyboard(supplier, can_delete=True):
     sid = supplier['id']
     buttons = [[InlineKeyboardButton("✏️ Переименовать", callback_data=f"supplier:rename:{sid}")]]
     if can_delete:
         buttons.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"supplier:delete:{sid}")])
     buttons += [
-        [InlineKeyboardButton("📤 Загрузить прайс", callback_data=f"supplier:upload:{sid}")],
         [InlineKeyboardButton("📥 Выгрузить прайс (Excel)", callback_data=f"supplier:export:{sid}")],
         [InlineKeyboardButton("⚙️ Валюта, НДС и доставка", callback_data=f"supplier:settings:{sid}")],
         [InlineKeyboardButton("👥 Все поставщики", callback_data="nav:suppliers")],
@@ -465,7 +367,6 @@ def supplier_delete_keyboard(sid):
 def settings_keyboard(supplier):
     sid = supplier['id']
     buttons = [
-        [InlineKeyboardButton("📤 Загрузить прайс", callback_data=f"supplier:upload:{sid}")],
         [InlineKeyboardButton(f"Валюта: {supplier['currency']}", callback_data=f"settings:currency:{sid}")],
         [InlineKeyboardButton(f"НДС: {supplier['tax_status']}", callback_data=f"settings:vat:{sid}")],
         [InlineKeyboardButton(f"🚚 Доставка: {_delivery_label(supplier.get('delivery_workdays'))}", callback_data=f"settings:delivery:{sid}")],
@@ -487,18 +388,25 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
-    await _clean_navigation(
-        update.effective_message, context,
-        "👋 Mobi Price Finder\n\nВыбирай нужный раздел кнопками ниже. "
-        "Для поиска просто напиши название товара.",
-        reply_markup=mode_keyboard(), main_menu=True,
+    await update.effective_message.reply_text(
+        "👋 Mobi Price Finder\n\n/suppliers — выбрать/добавить поставщика\n"
+        "/settings — валюта и НДС выбранного поставщика\n"
+        "/prices — сохранённые цены выбранного поставщика\n"
+        "/find iPhone 17 Pro 256GB Black — сравнить поставщиков\n"
+        "/menu — меню и режим работы\n"
+        "Просто напиши название товара — бот выполнит поиск.\n"
+        "Прайсы с ценами бот предложит сохранить.\n"
+        "Для длинного текстового прайса выбери 📚 Прайс частями.",
+        reply_markup=mode_keyboard(),
     )
+    if onliner_ui.can_launch(update):
+        await update.effective_message.reply_text("🛍 Управление ассортиментом Onlíner", reply_markup=onliner_ui.panel_keyboard())
 
 
 async def suppliers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
-    await _clean_navigation(update.effective_message, context, "Выбери поставщика (рядом дата последнего прайса):", reply_markup=keyboard_suppliers())
+    await update.effective_message.reply_text("Выбери поставщика (рядом дата последнего прайса):", reply_markup=keyboard_suppliers())
 
 
 async def addsupplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,7 +424,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not s:
         await update.effective_message.reply_text("Сначала выбери поставщика через /suppliers")
         return
-    await _clean_navigation(update.effective_message, context,
+    await update.effective_message.reply_text(
         f"⚙️ {s['name']}\nВалюта: {s['currency']}\nНДС: {s['tax_status']}\nДоставка: {_delivery_label(s.get('delivery_workdays'))}",
         reply_markup=settings_keyboard(s),
     )
@@ -755,23 +663,16 @@ def _audit_cell(value):
     return value
 
 
-# XLSX limit: 1,048,576 rows per sheet, including header.
-_XLSX_DATA_ROWS_PER_SHEET = 1_048_575
-_supplier_export_lock = asyncio.Lock()
-
-
-def _build_supplier_export(supplier, offers, path):
-    """Write an Excel audit directly to disk with bounded RAM usage.
-
-    The caller supplies a streaming iterator of database records. Both sheets
-    split at Excel's row limit; original column order and audit rules remain.
-    """
+def _build_supplier_export(supplier, offers):
+    """Build an XLSX audit of DB state, including parsed view and raw fields."""
     from openpyxl import Workbook
-    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
-    workbook = Workbook(write_only=True)
+    workbook = Workbook()
+    all_sheet = workbook.active
+    all_sheet.title = 'Все товары'
+    check_sheet = workbook.create_sheet('Проверка')
     headers = [
         'ID записи', 'Исходное название (БД)', 'Модель в поиске', 'Бренд',
         'Память, GB', 'RAM, GB', 'Цвет', 'Регион', 'SIM', 'Состояние',
@@ -780,53 +681,10 @@ def _build_supplier_export(supplier, offers, path):
         'SIM сохранён в БД', 'Предупреждения БД',
     ]
     check_headers = ['ID записи', 'Исходное название', 'Причина проверки', 'Цена', 'Валюта']
-    all_widths = [13, 70, 29, 17, 15, 14, 22, 21, 18, 20, 16, 13, 16, 22, 12, 29, 22, 21, 18, 50]
-    check_widths = [13, 75, 65, 16, 14]
-    header_fill = PatternFill('solid', fgColor='17365D')
-    header_font = Font(color='FFFFFF', bold=True)
-    header_alignment = Alignment(vertical='center', wrap_text=True)
-    price_format = '#,##0.00'
-
-    def create_sheet(base, number, headings, widths, price_column):
-        title = base if number == 1 else f'{base} {number}'
-        sheet = workbook.create_sheet(title)
-        sheet.freeze_panes = 'C2' if base == 'Все товары' else 'B2'
-        sheet.auto_filter.ref = f'A1:{get_column_letter(len(headings))}{_XLSX_DATA_ROWS_PER_SHEET + 1}'
-        for idx, width in enumerate(widths, 1):
-            sheet.column_dimensions[get_column_letter(idx)].width = width
-        cells = []
-        for heading in headings:
-            cell = WriteOnlyCell(sheet, value=heading)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_alignment
-            cells.append(cell)
-        sheet.append(cells)
-        return sheet
-
-    all_number = check_number = 1
-    all_sheet = create_sheet('Все товары', all_number, headers, all_widths, 11)
-    check_sheet = create_sheet('Проверка', check_number, check_headers, check_widths, 4)
-    total = review_count = 0
+    all_sheet.append(headers)
+    check_sheet.append(check_headers)
     vat_labels = {'with_vat': 'С НДС', 'without_vat': 'Без НДС', 'unknown': 'Не указан'}
-    condition_labels = {'activated': 'Активирован', 'sealed': 'Запечатан',
-                        'refurbished': 'Восстановлен', 'used': 'Б/у'}
-
-    def format_row(sheet, values, price_col, date_col=None):
-        # Create styled cells only for columns that need a number format.
-        values = list(values)
-        for index, number_format in ((price_col - 1, price_format),
-                                      (date_col - 1, 'DD.MM.YYYY HH:MM') if date_col else (-1, '')):
-            if index >= 0 and values[index] is not None:
-                cell = WriteOnlyCell(sheet, value=values[index])
-                cell.number_format = number_format
-                values[index] = cell
-        sheet.append(values)
-
     for offer in offers:
-        if total and total % _XLSX_DATA_ROWS_PER_SHEET == 0:
-            all_number += 1
-            all_sheet = create_sheet('Все товары', all_number, headers, all_widths, 11)
         parsed = parse_product(offer['original_name'])
         def effective(key):
             value = parsed.get(key)
@@ -834,6 +692,8 @@ def _build_supplier_export(supplier, offers, path):
         conditions = parsed.get('condition') or offer.get('condition_tags') or []
         if isinstance(conditions, str):
             conditions = [conditions]
+        condition_labels = {'activated': 'Активирован', 'sealed': 'Запечатан',
+                            'refurbished': 'Восстановлен', 'used': 'Б/у'}
         status = ', '.join(condition_labels.get(str(c), str(c)) for c in conditions) or 'Не указано'
         date = offer.get('updated_at')
         if date and date.tzinfo:
@@ -850,10 +710,7 @@ def _build_supplier_export(supplier, offers, path):
             _audit_cell(offer.get('region')), _audit_cell(offer.get('sim')),
             '; '.join(str(x) for x in (offer.get('warnings') or [])),
         ]
-        format_row(all_sheet, row, 11, 14)
-        total += 1
-        if total % 100000 == 0:
-            logger.info('Excel export: %s rows written for supplier %s', total, supplier['id'])
+        all_sheet.append(row)
         reasons = []
         if not effective('model'):
             reasons.append('Модель не распознана')
@@ -867,17 +724,34 @@ def _build_supplier_export(supplier, offers, path):
             reasons.append('Модель из текста отличается от сохранённой')
         reasons += [str(w) for w in (offer.get('warnings') or [])]
         if reasons:
-            if review_count and review_count % _XLSX_DATA_ROWS_PER_SHEET == 0:
-                check_number += 1
-                check_sheet = create_sheet('Проверка', check_number, check_headers, check_widths, 4)
-            format_row(check_sheet, [offer['id'], _audit_cell(offer['original_name']),
-                                     '; '.join(reasons), price, offer.get('currency')], 4)
-            review_count += 1
+            check_sheet.append([offer['id'], _audit_cell(offer['original_name']),
+                                '; '.join(reasons), price, offer.get('currency')])
 
-    if total:
-        workbook.save(path)
-    workbook.close()
-    return total, review_count
+    for sheet, widths, price_col in [
+        (all_sheet, [13, 70, 29, 17, 15, 14, 22, 21, 18, 20, 16, 13, 16, 22, 12, 29, 22, 21, 18, 50], 11),
+        (check_sheet, [13, 75, 65, 16, 14], 4),
+    ]:
+        sheet.freeze_panes = 'C2' if sheet is all_sheet else 'B2'
+        sheet.auto_filter.ref = sheet.dimensions
+        sheet.row_dimensions[1].height = 28
+        for cell in sheet[1]:
+            cell.fill = PatternFill('solid', fgColor='17365D')
+            cell.font = Font(color='FFFFFF', bold=True)
+            cell.alignment = Alignment(vertical='center', wrap_text=True)
+        for col, width in enumerate(widths, 1):
+            sheet.column_dimensions[get_column_letter(col)].width = width
+        for row in sheet.iter_rows(min_row=2):
+            if row[0].row % 2 == 0:
+                for cell in row:
+                    cell.fill = PatternFill('solid', fgColor='F1F6FA')
+            row[price_col - 1].number_format = '#,##0.00'
+        if sheet is all_sheet:
+            for cell in sheet['N'][1:]:
+                cell.number_format = 'DD.MM.YYYY HH:MM'
+    data = BytesIO()
+    workbook.save(data)
+    data.seek(0)
+    return data, check_sheet.max_row - 1
 
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -898,7 +772,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if op == 'cancel':
             context.user_data.pop('auto_draft', None)
-            context.chat_data.setdefault('uploaded_price_messages', []).extend(draft.get('message_ids', []))
             try:
                 await context.bot.edit_message_reply_markup(
                     chat_id=draft.get('status_chat_id'), message_id=draft.get('status_message_id'),
@@ -923,7 +796,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text('❌ Ошибка сохранения. Старый прайс должен остаться без изменений. Проверь Railway Logs.')
                 return
             context.user_data.pop('auto_draft', None)
-            context.chat_data.setdefault('uploaded_price_messages', []).extend(draft.get('message_ids', []))
             try:
                 await context.bot.edit_message_reply_markup(
                     chat_id=draft.get('status_chat_id'), message_id=draft.get('status_message_id'),
@@ -1008,12 +880,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             '🏦 БСБ Банк — продажа USD\n'
             f'Источник: {MYFIN_URL}')
     elif action == 'nav:suppliers':
-        await _clean_navigation(query.message, context, 'Выбери поставщика:', reply_markup=keyboard_suppliers())
+        await query.message.reply_text('Выбери поставщика:', reply_markup=keyboard_suppliers())
     elif action == 'nav:settings':
         sid = context.user_data.get('supplier_id')
         supplier = get_supplier(sid) if sid else None
         if supplier:
-            await _clean_navigation(query.message, context,
+            await query.message.reply_text(
                 f"⚙️ {supplier['name']}", reply_markup=settings_keyboard(supplier)
             )
         else:
@@ -1058,8 +930,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Поставщик не найден")
             return
         context.user_data['supplier_id'] = sid
-        context.user_data['mode'] = 'auto'
-        await _clean_navigation(query.message, context, f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, allowed(update)))
+        await query.message.reply_text(f"✅ Выбран поставщик:\n{_supplier_title(s)}", reply_markup=supplier_manage_keyboard(s, allowed(update)))
         await show_pending(query.message, context)
     elif action.startswith('supplier:'):
         parts = action.split(':')
@@ -1070,47 +941,24 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not s:
             await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
             return
-        if operation == 'upload':
-            if context.user_data.get('auto_draft') or context.user_data.get('parts') or context.user_data.get('excel_album') or context.user_data.get('excel_pending'):
-                await query.message.reply_text('Сначала заверши или отмени предыдущую загрузку прайса.')
-                return
-            context.user_data['supplier_id'] = sid
-            context.user_data['mode'] = 'import'
-            await _clean_navigation(query.message, context,
-                f'📤 Загрузка прайса для поставщика «{s["name"]}».\n\n'
-                'Отправьте файл CSV или Excel либо текстовый прайс. '
-                'Файл будет обработан для указанного поставщика.',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('↩️ К поставщику', callback_data=f'pick:{sid}')]]))
-            return
         if operation == 'export':
-            if _supplier_export_lock.locked():
-                await query.message.reply_text('⏳ Другая выгрузка Excel уже выполняется. Повтори позже.')
-                return
-            async with _supplier_export_lock:
-                await query.message.reply_text('📦 Формирую Excel. Для большого прайса это может занять несколько минут.')
-                try:
-                    with tempfile.TemporaryDirectory(prefix='pricefinder_export_') as folder:
-                        file_name = f'pricefinder_supplier_{sid}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
-                        path = os.path.join(folder, file_name)
-                        total, review_count = await asyncio.to_thread(
-                            _build_supplier_export, s, iter_supplier_offers(sid), path)
-                        if not total:
-                            await query.message.reply_text('У этого поставщика пока нет сохранённых товаров.')
-                            return
-                        logger.info('Excel export: ready supplier=%s rows=%s review=%s size=%s',
-                                    sid, total, review_count, os.path.getsize(path))
-                        with open(path, 'rb') as document:
-                            await query.message.reply_document(
-                                document=document, filename=file_name,
-                                read_timeout=600, write_timeout=600,
-                                caption=(f'📥 Выгрузка из PostgreSQL: {s["name"]}\n'
-                                         f'Товаров: {total}\n'
-                                         f'Позиций для проверки: {review_count}\n'
-                                         'Показаны все сохранённые товары, включая устаревшие.'),
-                            )
-                except Exception:
-                    logger.exception('Failed to export supplier %s', sid)
-                    await query.message.reply_text('Не удалось выгрузить прайс. Проверь логи Railway.')
+            try:
+                offers = export_supplier_offers(sid)
+                if not offers:
+                    await query.message.reply_text('У этого поставщика пока нет сохранённых товаров.')
+                    return
+                file_buffer, review_count = _build_supplier_export(s, offers)
+                file_name = f'pricefinder_supplier_{sid}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
+                await query.message.reply_document(
+                    document=file_buffer, filename=file_name,
+                    caption=(f'📥 Выгрузка из PostgreSQL: {s["name"]}\n'
+                             f'Товаров: {len(offers)}\n'
+                             f'Позиций для проверки: {review_count}\n'
+                             'Показаны все сохранённые товары, включая устаревшие.'),
+                )
+            except Exception:
+                logger.exception('Failed to export supplier %s', sid)
+                await query.message.reply_text('Не удалось выгрузить прайс. Проверь логи Railway.')
         elif operation == 'rename':
             context.user_data.pop('await_name', None)
             context.user_data['await_rename_id'] = sid
@@ -1149,7 +997,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text('Поставщик уже удалён.', reply_markup=keyboard_suppliers())
         elif operation == 'settings':
             context.user_data['supplier_id'] = sid
-            await _clean_navigation(query.message, context, f"⚙️ {s['name']}", reply_markup=settings_keyboard(s))
+            await query.message.reply_text(f"⚙️ {s['name']}", reply_markup=settings_keyboard(s))
     elif action.startswith('settings:delivery:'):
         sid = int(action.rsplit(':', 1)[1])
         supplier = get_supplier(sid)
@@ -1207,7 +1055,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return report, selected_items, skipped
             report, selected_items, skipped = await asyncio.to_thread(_process_import)
             context.user_data.pop('excel_pending', None)
-            context.user_data['mode'] = 'auto'  # Import finished; allow normal product searches.
             try:
                 def _save_profiles():
                     profiles = [{**it, 'fingerprint': sheet_fingerprint(it.get('data', staged['data']), it['sheet'], it['header_row'], it['mapping'])} for it in selected_items]
@@ -1327,8 +1174,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             draft, added = append_to_auto_draft(context, sid, text)
-            if added:
-                draft.setdefault('message_ids', []).append(update.effective_message.message_id)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc), reply_markup=auto_draft_keyboard(existing_draft))
             return
@@ -1369,9 +1214,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text('Сначала выбери поставщика через /suppliers.')
             return
         try:
-            draft, added = append_to_auto_draft(context, sid, text)
-            if added:
-                draft.setdefault('message_ids', []).append(update.effective_message.message_id)
+            draft, _ = append_to_auto_draft(context, sid, text)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return
@@ -1459,63 +1302,10 @@ async def _finish_excel_album(context, message, key):
             return
 
 
-_csv_import_lock = asyncio.Lock()
-
-
-async def handle_large_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Use a path provided by a co-located local Bot API; never buffer 350 MB."""
-    if not await authorize(update):
-        return
-    message = update.effective_message
-    document = message.document
-    sid = context.user_data.get('supplier_id')
-    supplier = get_supplier(sid) if sid else None
-    if not supplier:
-        await message.reply_text('Сначала выбери поставщика через /suppliers.')
-        return
-    if context.user_data.get('auto_draft') or context.user_data.get('parts') or context.user_data.get('excel_album'):
-        await message.reply_text('Сначала заверши предыдущую загрузку прайса.')
-        return
-    if supplier['currency'] != 'BYN' or supplier['tax_status'] not in ('with_vat', 'without_vat'):
-        await message.reply_text('CSV с розничной ценой в BYN: выбери для поставщика валюту BYN и НДС в /settings.')
-        return
-    if document.file_size and document.file_size > MAX_CSV_BYTES:
-        await message.reply_text('CSV превышает установленный предел MAX_CSV_BYTES.')
-        return
-    if not os.getenv('TELEGRAM_LOCAL_API_URL'):
-        await message.reply_text('Большой CSV требует локального Telegram Bot API (TELEGRAM_LOCAL_API_URL).')
-        return
-    if _csv_import_lock.locked():
-        await message.reply_text('Сейчас выполняется другой CSV-импорт. Повтори позже.')
-        return
-    async with _csv_import_lock:
-        status = await message.reply_text('📥 CSV принят. Получаю файл и импортирую в БД. Старые цены сохранятся при ошибке.')
-        try:
-            tg_file = await document.get_file(read_timeout=120)
-            file_path = Path(tg_file.file_path or '')
-            if not file_path.is_absolute() or not file_path.is_file():
-                raise ValueError('Локальный Bot API не предоставил путь к файлу. Проверь совместный контейнер и --local.')
-            # Local API returns a path inside its storage directory.
-            root = Path(os.getenv('TELEGRAM_API_FILES_ROOT', '/data/bot-api')).resolve()
-            if not file_path.resolve().is_relative_to(root):
-                raise ValueError('Небезопасный путь файла от Bot API.')
-            result = await asyncio.to_thread(import_large_csv, file_path, sid, supplier['tax_status'])
-            await status.edit_text('✅ CSV загружен для выбранного поставщика.\n'
-                f'Строк: {result["total"]:,}\nСохранено: {result["saved"]:,}\n'
-                f'Пропущено: {result["skipped"]:,}\nДубликаты: {result["duplicates"]:,}\n'
-                'Цена: «Розничная цена», BYN.')
-        except Exception as exc:
-            logger.exception('Large CSV import failed')
-            await status.edit_text('❌ CSV не импортирован, старый прайс сохранён.\n' + str(exc)[:350])
-
-
 async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await authorize(update):
         return
     message = update.effective_message
-    if message.document and (message.document.file_name or '').lower().endswith('.csv'):
-        await handle_large_csv(update, context)
-        return
     if context.user_data.get('auto_draft'):
         await message.reply_text('Сначала сохрани или отмени текстовый черновик.', reply_markup=auto_draft_keyboard(context.user_data['auto_draft']))
         return
@@ -1530,8 +1320,6 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if supplier['currency'] not in ('USD', 'BYN', 'RUB', 'EUR') or supplier['tax_status'] not in ('with_vat', 'without_vat'):
         await message.reply_text('Сначала укажи валюту и НДС в /settings.')
         return
-    # Keep every document message until the complete batch has been saved or cancelled.
-    context.chat_data.setdefault('uploaded_price_messages', []).append(message.message_id)
     album_id = message.media_group_id
     key = f'{message.chat_id}:{album_id}' if album_id else None
     draft = context.user_data.get('excel_album')
@@ -1896,46 +1684,7 @@ async def run_search(message, query_text, context):
         interpreted = _interpret_search_query(query_text)
         requested = parse_product(interpreted)
         anchor = _search_prefilter_anchor(query_text, requested)
-        model = requested.get('model') or ''
-        # All recognized iPhone generations use the indexed model column.
-        # Unknown/abbreviated supplier names are also considered by requiring
-        # both generation and storage where specified. Python validates the
-        # complete model, capacity and color afterwards.
-        iphone = re.fullmatch(
-            r'iPhone (\d{1,2})(?: (Pro Max|Pro|Plus|Mini|Air))?', model, re.I
-        )
-        if iphone:
-            generation = iphone.group(1)
-            variant = iphone.group(2)
-            storage = requested.get('storage_gb')
-            if variant:
-                # Pro Max previously had this optimized path; extend it to
-                # other iPhone variants without requiring supplier branding.
-                variant_terms = ('pro', 'max') if variant.casefold() == 'pro max' else (variant.casefold(),)
-                name_terms = (generation, *variant_terms)
-            elif storage is not None:
-                # Generation alone matches far too many catalogue entries.
-                # Storage is required by the final matcher, so using it as a
-                # prefilter cannot discard a valid textual match.
-                name_terms = (generation, str(storage))
-            else:
-                name_terms = (generation, 'iphone')
-            candidates = search_offers(model=model, name_terms=name_terms)
-        elif model:
-            # A single generation number (e.g. "11" or "15") is far too
-            # broad for a million-row catalogue. Use the structured model
-            # index plus a two-part supplier-name fallback. A textual part
-            # of 4+ characters keeps the trigram index useful.
-            model_tokens = re.findall(r'[a-zа-яё0-9]+', model.casefold())
-            distinctive = [t for t in model_tokens if len(t) >= 4 and t not in {'with', 'plus'}]
-            number_tokens = [t for t in model_tokens if any(c.isdigit() for c in t)]
-            if distinctive and number_tokens:
-                candidates = search_offers(model=model, name_terms=(distinctive[0], number_tokens[0]))
-            else:
-                candidates = search_offers(anchor)
-        else:
-            candidates = search_offers(anchor)
-        matches = [o for o in candidates
+        matches = [o for o in search_offers(anchor)
                    if _offer_matches(query_text, requested, o)]
     if not matches:
         await message.reply_text(f'🔎 {query_text}\nПо актуальным прайсам совпадений нет.')
@@ -2071,16 +1820,9 @@ async def combined_post_init(application):
 def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
+    onliner_store.init()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
-    builder = ApplicationBuilder().token(token).post_init(combined_post_init)
-    local_api = os.getenv('TELEGRAM_LOCAL_API_URL', '').rstrip('/')
-    if local_api:
-        builder = (builder.base_url(local_api + '/bot')
-                   .base_file_url(local_api + '/file/bot').local_mode(True))
-    app = builder.build()
-    _install_message_tracking()
-    app.add_handler(MessageHandler(filters.ALL, _cleanup_before, block=True), group=-1)
-    app.add_handler(CallbackQueryHandler(_cleanup_before, block=True), group=-1)
+    app = ApplicationBuilder().token(token).post_init(combined_post_init).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
@@ -2088,11 +1830,10 @@ def main():
     app.add_handler(CommandHandler('cancelrate', cancelrate))
     app.add_handler(CommandHandler('mtsupdate', mts_update_command))
     a1_bot_integration.register(app)
+    onliner_ui.register(app)
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.ALL, _cleanup_after), group=1)
-    app.add_handler(CallbackQueryHandler(_cleanup_after), group=1)
     app.add_error_handler(on_error)
     logger.info('Mobi Price Finder запущен')
     app.run_polling()
