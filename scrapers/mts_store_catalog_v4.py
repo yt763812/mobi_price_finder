@@ -10,6 +10,7 @@ from decimal import Decimal
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 from scrapers.mts import CardsParser, read_price
 from scrapers.mts_crawl import PaginationLinks, page_number
+from scrapers.mts_modern import discover_cards, detail_offer
 
 
 def valid_store_product_url(url, catalogue_url):
@@ -129,6 +130,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
     incomplete = False
     pagination_probe_count = 0
     pagination_anomalies = []
+    expected_page_count = None
     while todo:
         n, page_url = todo.pop(0)
         if n in visited:
@@ -137,21 +139,34 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             incomplete = True
             break
         html = fetcher.get(page_url)
+        # The site exposes a count such as 'Показано 1–12 из 546'.
+        # If pagination silently truncates, never commit a partial snapshot.
+        if n == 1:
+            match = re.search(r'Показано\s*1\s*[–—-]\s*(\d+)\s*из\s*(\d+)',
+                              re.sub(r'<[^>]*>', ' ', html), re.I)
+            if match:
+                page_size, total = map(int, match.groups())
+                if page_size and total >= page_size:
+                    expected_page_count = (total + page_size - 1) // page_size
         parser = CardsParser()
         parser.feed(html)
+        modern = []
         if not parser.cards:
-            raise RuntimeError(f'No MTS catalogue cards on {page_url}')
+            modern = discover_cards(html, page_url)
+        if not parser.cards and not modern:
+            raise RuntimeError(f'No MTS product cards (legacy or modern) on {page_url}')
         # Out-of-range MTS page numbers may return the first page again.
         # A page containing NO unseen product URLs is a terminal duplicate,
         # not a real extra catalogue page. Never count its cards.
         page_urls = {urljoin(page_url, c.url or '') for c in parser.cards if c.url}
+        page_urls.update(c.url for c in modern)
         if page_urls and page_urls.issubset(seen_urls):
             print(f'MTS catalog-only {category}: terminal repeated page {n}; '
                   f'counting {len(visited)} genuine pages', flush=True)
             break
         visited.add(n)
         seen_urls.update(page_urls)
-        cards_total += len(parser.cards)
+        cards_total += len(parser.cards) + len(modern)
         if cards_total > max_products:
             incomplete = True
             break
@@ -186,6 +201,27 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                 conflicts.append((card.sku, url, old))
                 continue
             products[key] = offer
+        # Modern MTS pages expose 'from' catalogue prices. Verify each product
+        # detail's explicit SINGLE PAYMENT price before considering an offer.
+        for card in modern:
+            url = card.url
+            if not valid_store_product_url(url, catalogue_url):
+                issues.append(('?', f'invalid modern product URL: {url}'))
+                continue
+            key = hashlib.sha256(url.encode('utf-8')).hexdigest()
+            if key in products or key in conflicted:
+                continue
+            try:
+                detail = fetcher.get(url)
+                sku, exact, error = detail_offer(detail, url, card.name)
+            except Exception as exc:
+                issues.append((url, f'detail HTTP/parse failure: {type(exc).__name__}: {exc}'))
+                continue
+            if error is not None:
+                issues.append((sku or url, error))
+                continue
+            products[key] = CatalogOffer(sku, card.name, url, exact, 'BYN',
+                                         False, '', '')
         print(f'MTS catalog-only {category}: pages={len(visited)}, cards={cards_total}, '
               f'priced={len(products)}, issues={len(issues)}', flush=True)
         links = PaginationLinks()
@@ -200,7 +236,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         # Probe the next sequential page rather than declaring completion.
         # A repeated response is handled at the top of the loop, while an
         # empty/invalid probe fails closed (no supplier write based on it).
-        if not todo and len(parser.cards) >= 18:
+        if not todo and (len(parser.cards) >= 18 or len(modern) >= 12):
             next_n = n + 1
             parts = urlsplit(catalogue_url)
             params = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
@@ -213,7 +249,11 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                 pagination_probe_count += 1
                 pagination_anomalies.append(f'no pagination after full page {n}; probed page {next_n}')
                 print(f'MTS catalog-only {category}: PAGINATION_PROBE page={next_n} '
-                      f'(page {n} had {len(parser.cards)} cards)', flush=True)
+                      f'(page {n} had {len(parser.cards) + len(modern)} cards)', flush=True)
+    if expected_page_count and len(visited) < expected_page_count:
+        incomplete = True
+        pagination_anomalies.append(
+            f'only {len(visited)} of {expected_page_count} advertised catalogue pages reached')
     # One detail request per conflicting URL, not one per product.
     for sku, url, original in conflicts:
         key = hashlib.sha256(url.encode('utf-8')).hexdigest()
