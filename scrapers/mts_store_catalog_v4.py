@@ -154,6 +154,14 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         if not parser.cards:
             modern = discover_cards(html, page_url)
         if not parser.cards and not modern:
+            # The current MTS pagination permits ?page=N beyond its final
+            # page and returns a valid, empty catalogue. This is a normal
+            # terminal probe, *not* a broken section. Never accept an empty
+            # first page or an empty page inside an advertised page range.
+            if n > 1 and (expected_page_count is None or n > expected_page_count):
+                print(f'MTS catalog-only {category}: terminal empty page {n}; '
+                      f'counting {len(visited)} genuine pages', flush=True)
+                break
             raise RuntimeError(f'No MTS product cards (legacy or modern) on {page_url}')
         # Out-of-range MTS page numbers may return the first page again.
         # A page containing NO unseen product URLs is a terminal duplicate,
