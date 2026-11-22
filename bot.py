@@ -21,8 +21,6 @@ from telegram.ext import (
 from myfin_rate import MYFIN_URL, fetch_bsb_usd_sale
 from mts_daily_scheduler import post_init as mts_post_init
 import a1_bot_integration
-from onliner import telegram_ui as onliner_ui
-from onliner import store as onliner_store
 from database import (
     add_supplier, get_supplier, get_supplier_offers, get_offers, search_offers, init_db, list_suppliers,
     save_price_list, save_excel_rows, update_supplier_settings, rename_supplier, delete_supplier,
@@ -285,8 +283,6 @@ async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await mode(update, context)
-    if onliner_ui.can_launch(update):
-        await update.effective_message.reply_text("🛍 Управление ассортиментом Onlíner", reply_markup=onliner_ui.panel_keyboard())
 
 
 def _price_import_time(value, short=False):
@@ -399,8 +395,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Для длинного текстового прайса выбери 📚 Прайс частями.",
         reply_markup=mode_keyboard(),
     )
-    if onliner_ui.can_launch(update):
-        await update.effective_message.reply_text("🛍 Управление ассортиментом Onlíner", reply_markup=onliner_ui.panel_keyboard())
 
 
 async def suppliers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1820,7 +1814,6 @@ async def combined_post_init(application):
 def main():
     token = os.environ['TELEGRAM_BOT_TOKEN']
     init_db()
-    onliner_store.init()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
     app = ApplicationBuilder().token(token).post_init(combined_post_init).build()
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
@@ -1830,7 +1823,6 @@ def main():
     app.add_handler(CommandHandler('cancelrate', cancelrate))
     app.add_handler(CommandHandler('mtsupdate', mts_update_command))
     a1_bot_integration.register(app)
-    onliner_ui.register(app)
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
