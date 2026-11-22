@@ -99,33 +99,47 @@ def detail_offer(html: str, detail_url: str, expected_name: str):
     if not matched:
         return None, None, 'detail missing product code'
     sku = matched.group(1)
+    # The live 2026 storefront often renders the payment label, current price,
+    # and crossed-out old price in different nested DOM branches. Looking at
+    # parent.get_text() loses the boundary and rejects the valid current price.
+    # Read the *first* monetary value following the explicit payment label in
+    # document order, before any payment-plan / old-price labels.
+    visible = [node for node in main.find_all(string=True)
+               if node.parent and node.parent.name not in ('script', 'style', 'noscript')
+               and str(node).strip()]
     prices = set()
-    # Inspect explicit payment labels and their nearest siblings/parent containers.
-    for node in main.find_all(string=True):
+    for i, node in enumerate(visible):
         label = ' '.join(str(node).split())
-        if not SINGLE.fullmatch(label):
+        m = re.search(r'Единый\s+плат[её]ж|Оплата\s+сразу|Полная\s+стоимость', label, re.I)
+        if not m:
             continue
-        holder = node.parent
-        for parent in (holder, holder.parent if holder else None, holder.parent.parent if holder and holder.parent else None):
-            if parent is None:
-                continue
-            # Short payment block, never the entire product page or sale-price/old-price area.
-            raw = _text(parent)
-            if len(raw) > 150:
-                continue
-            raw = re.sub(r'^.*?Единый\s+плат[её]ж', '', raw, flags=re.I)
-            # A discount old price may follow the new one; pick only a dedicated
-            # price leaf if possible, otherwise reject ambiguous multi-price blocks.
-            value = _price(raw)
-            if value is not None:
-                prices.add(value)
+        # Ignore label text outside the purchase selector and unrelated copies.
+        # Limit scanning to the nearest short textual region; never search the
+        # entire page for a price, nor fall back to a catalogue "от" amount.
+        pieces = [label[m.end():].strip()] if label[m.end():].strip() else []
+        for following in visible[i+1:i+9]:
+            part = ' '.join(str(following).split())
+            if re.search(r'настроить\s+оплату|оплата\s+частями|рассроч|кредит|купить|в\s+корзину|самовывоз|доставка', part, re.I):
                 break
-        # For split sibling layout, only inspect the immediate next element.
-        sibling = holder.find_next_sibling() if holder else None
-        if sibling is not None:
-            value = _price(_text(sibling))
-            if value is not None:
-                prices.add(value)
+            pieces.append(part)
+            combined = ' '.join(pieces)
+            if len(combined) > 145:
+                break
+            # First amount, explicitly denominated in BYN/rubles, wins.
+            # Following values may be crossed-out prices, so do not require
+            # the surrounding container to contain only one amount.
+            hit = MONEY.search(combined.replace('\u202f', ' '))
+            if hit:
+                prefix = combined[:hit.start()]
+                if re.search(r'\bот\s*$', prefix, re.I) or EXCLUDE.search(prefix):
+                    break
+                try:
+                    value = Decimal(hit.group(1).replace(' ', '').replace('\xa0', '').replace(',', '.'))
+                except InvalidOperation:
+                    break
+                if value.is_finite() and value > 0:
+                    prices.add(value)
+                break
     if len(prices) != 1:
         return sku, None, f'expected one explicit single-payment price, found {sorted(prices)}'
     return sku, next(iter(prices)), None
