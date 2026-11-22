@@ -19,7 +19,23 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from mts_store_audit import SECTIONS as ORIGINAL_SECTIONS
 
 # The former accessory_audio URL returned a confirmed 404. Do not request it.
-SECTIONS = {k: v for k, v in ORIGINAL_SECTIONS.items() if k != 'accessory_audio'}
+# Public MTS 2026 navigation. Remove obsolete 404 parent/leaf URLs.
+# Each listed category is real; do not silently treat this as exhaustive store coverage.
+SECTIONS = {
+    'smartphones': 'https://shop.mts.by/phones/',
+    'tablets': 'https://shop.mts.by/tablet/',
+    'laptops': 'https://shop.mts.by/computer-equipment/laptops/',
+    'watches': 'https://shop.mts.by/smart-watch/',
+    'headphones': 'https://shop.mts.by/audio/headphones/',
+    'tabletpc_all': 'https://shop.mts.by/computer-equipment/',
+    'gadgets_all': 'https://shop.mts.by/audio/',
+    'home_all': 'https://shop.mts.by/for-home/',
+    'tv_all': 'https://shop.mts.by/tv/',
+    'televisions': 'https://shop.mts.by/tv/',
+    'accessories_all': 'https://shop.mts.by/accessories/',
+    'terminals': 'https://shop.mts.by/terminals/',
+    'gaming_devices': 'https://shop.mts.by/computer-equipment/consoles-gamepades/game-consoles/',
+}
 
 # This route returned HTTP 404 in the first audit. Keep it visible in the report.
 KNOWN_UNAVAILABLE = set()
