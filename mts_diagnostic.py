@@ -12,6 +12,7 @@ from decimal import Decimal
 import json
 import os
 import time
+import traceback
 from urllib.parse import urljoin
 
 
@@ -59,12 +60,20 @@ def run_diagnostic(*, emit=print, fetcher=None, section='smartphones', limit=Non
     def one(index, card):
         started_one = time.monotonic()
         detail_url = urljoin(url, card.url)
+        stage = 'prepare'
         try:
             # In legacy layout, capture the catalogue observation separately.
             listed = (str(read_price(card.displayed_price)) if read_price(card.displayed_price) is not None
                       else None) if mode == 'legacy' else None
+            stage = 'fetch'
             content = fetcher.get(detail_url)
-            sku, price, error = detail_offer(content, detail_url, card.name)
+            if not isinstance(content, str):
+                raise TypeError(f'fetcher returned {type(content).__name__}, expected HTML str')
+            stage = 'parse'
+            parsed = detail_offer(content, detail_url, card.name)
+            if not isinstance(parsed, tuple) or len(parsed) != 3:
+                raise TypeError(f'detail_offer returned {type(parsed).__name__}, expected 3-tuple')
+            sku, price, error = parsed
             outcome = 'priced' if error is None and isinstance(price, Decimal) and price > 0 else 'unpriced'
             return {'index': index, 'name': card.name[:110], 'url': detail_url,
                     'status': outcome, 'sku': sku, 'price_byn': str(price) if outcome == 'priced' else None,
@@ -72,7 +81,9 @@ def run_diagnostic(*, emit=print, fetcher=None, section='smartphones', limit=Non
                     'elapsed_seconds': round(time.monotonic() - started_one, 2)}
         except Exception as exc:
             return {'index': index, 'name': card.name[:110], 'url': detail_url,
-                    'status': 'http_error', 'reason': f'{type(exc).__name__}: {str(exc)[:200]}',
+                    'status': 'exception', 'stage': stage,
+                    'reason': f'{type(exc).__name__}: {str(exc)[:200]}',
+                    'traceback': traceback.format_exc(limit=9)[-2400:],
                     'elapsed_seconds': round(time.monotonic() - started_one, 2)}
 
     results = []
@@ -86,7 +97,7 @@ def run_diagnostic(*, emit=print, fetcher=None, section='smartphones', limit=Non
     counts = Counter(x['status'] for x in results)
     emit('MTS_DIAG_SUMMARY ' + json.dumps({
         'section': section, 'mode': mode, 'tested': len(results),
-        'priced': counts['priced'], 'unpriced': counts['unpriced'], 'http_errors': counts['http_error'],
+        'priced': counts['priced'], 'unpriced': counts['unpriced'], 'exceptions': counts['exception'],
         'elapsed_seconds': round(time.monotonic()-started, 2),
         'no_database_write': True,
     }, ensure_ascii=False))
