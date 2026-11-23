@@ -44,6 +44,15 @@ def _product_link(href, base):
         return None
     if u.username or u.password or u.query or u.fragment:
         return None
+    # News/marketing pages and category-navigation tiles are not SKU pages.
+    # Keep real game-console SKUs: only exclude the category landing URL.
+    if (u.path.startswith('/news-actions/') or
+        u.path.rstrip('/').split('/')[-1] in {
+            'game-consoles', 'consoles-gamepades', 'smart-watch',
+            'headphones', 'laptops', 'tablet', 'phones', 'audio',
+            'computer-equipment', 'accessories', 'tv', 'for-home',
+        }):
+        return None
     parts = [part for part in u.path.split('/') if part]
     # A product is nested below its category (not a category itself).
     return url if len(parts) >= 3 and parts[-1].lower() not in ('catalog','index.php') else None
@@ -117,29 +126,3 @@ def detail_offer(html: str, detail_url: str, expected_name: str):
         # Limit scanning to the nearest short textual region; never search the
         # entire page for a price, nor fall back to a catalogue "от" amount.
         pieces = [label[m.end():].strip()] if label[m.end():].strip() else []
-        for following in visible[i+1:i+9]:
-            part = ' '.join(str(following).split())
-            if re.search(r'настроить\s+оплату|оплата\s+частями|рассроч|кредит|купить|в\s+корзину|самовывоз|доставка', part, re.I):
-                break
-            pieces.append(part)
-            combined = ' '.join(pieces)
-            if len(combined) > 145:
-                break
-            # First amount, explicitly denominated in BYN/rubles, wins.
-            # Following values may be crossed-out prices, so do not require
-            # the surrounding container to contain only one amount.
-            hit = MONEY.search(combined.replace('\u202f', ' '))
-            if hit:
-                prefix = combined[:hit.start()]
-                if re.search(r'\bот\s*$', prefix, re.I) or EXCLUDE.search(prefix):
-                    break
-                try:
-                    value = Decimal(hit.group(1).replace(' ', '').replace('\xa0', '').replace(',', '.'))
-                except InvalidOperation:
-                    break
-                if value.is_finite() and value > 0:
-                    prices.add(value)
-                break
-    if len(prices) != 1:
-        return sku, None, f'expected one explicit single-payment price, found {sorted(prices)}'
-    return sku, next(iter(prices)), None
