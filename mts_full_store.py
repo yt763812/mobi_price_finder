@@ -73,10 +73,18 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
     if crawler is None:
         from scrapers.mts_store_catalog_v4 import crawl_mts_catalog as crawler
     results, rows, failures = {}, [], []
+    # Reuse successful verified details across overlapping catalogue sections.
+    shared_detail_cache = {}
+    workers = int(os.getenv('MTS_DETAIL_WORKERS', '4'))
     for section in sections:
         emit(f'START MTS full/{section}')
         try:
-            result = crawler(retrying, SECTIONS[section], section, max_pages=max_pages)
+            if crawler.__module__ == 'scrapers.mts_store_catalog_v4' and crawler.__name__ == 'crawl_mts_catalog':
+                result = crawler(retrying, SECTIONS[section], section,
+                                 max_pages=max_pages, detail_workers=workers,
+                                 detail_cache=shared_detail_cache)
+            else:
+                result = crawler(retrying, SECTIONS[section], section, max_pages=max_pages)
             row = {'section': section, 'pages': result.pages, 'cards': result.cards,
                    'priced': len(result.products), 'issues': [str(x) for x in result.issues],
                    'incomplete': bool(result.incomplete),
@@ -85,11 +93,15 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
             minimum = BASELINE_MIN_PAGES.get(section, 1)
             if result.pages < minimum:
                 baseline_message = f'pages {result.pages} below historical baseline {minimum}'
-                # Historical thresholds from the previous site layout are
-                # advisory only. Never silently reduce structural validation.
-                row['coverage_warning'] = baseline_message
-                emit(f'COVERAGE_WARNING MTS {section}: {baseline_message}; '
-                     'continue only if every product and page validates')
+                if section == 'accessories_all':
+                    # This category changes size on the live MTS site. A historical
+                    # page count alone must not discard an otherwise valid crawl.
+                    # Keep the warning visible and retain all structural checks.
+                    row['coverage_warning'] = baseline_message
+                    emit(f'COVERAGE_WARNING MTS {section}: {baseline_message}; '
+                         'allowing save only if all other validation passes')
+                else:
+                    row['error'] = baseline_message
             if result.incomplete or result.issues or not result.products:
                 row['error'] = row.get('error') or 'incomplete, invalid or empty section'
             if row.get('error'):
