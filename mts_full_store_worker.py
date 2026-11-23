@@ -5,7 +5,6 @@ import traceback
 def run_full_store(max_pages=100, report=None):
     import psycopg
     from web_worker import LOCK_KEY
-    from mts_full_store import collect_full_store
     from mts_full_store_snapshot import replace_full_store
     dsn = os.environ['DATABASE_URL']
     def emit(s):
@@ -17,6 +16,12 @@ def run_full_store(max_pages=100, report=None):
             emit('MTS: другой сбор уже выполняется')
             return 3
         try:
+            # Short diagnostic mode: no supplier snapshot can be written, even
+            # when MTS_FULL_STORE_COMMIT=1 by mistake.
+            if os.getenv('MTS_DIAGNOSTIC_ONLY', '0') == '1':
+                from mts_diagnostic import run_diagnostic
+                return run_diagnostic(emit=emit)
+            from mts_full_store import collect_full_store
             merged, summary = collect_full_store(max_pages=max_pages, emit=emit)
             if not summary['ready_to_commit']:
                 emit('NOT SAVED: full-store validation failed; previous supplier untouched')
