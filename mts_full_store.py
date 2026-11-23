@@ -4,6 +4,7 @@ import json
 import os
 import re
 import traceback
+import inspect
 import unicodedata
 from collections import defaultdict
 from decimal import Decimal
@@ -73,6 +74,8 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
     retrying = RetryingFetcher(fetcher)
     if crawler is None:
         from scrapers.mts_store_catalog_v4 import crawl_mts_catalog as crawler
+    # Log the actual deployed crawler, rather than assuming GitHub and Railway match.
+    emit(f'MTS_CRAWLER_LOADED module={crawler.__module__} file={inspect.getsourcefile(crawler)} version={getattr(__import__(crawler.__module__, fromlist=["CRAWLER_VERSION"]), "CRAWLER_VERSION", "unknown")}')
     results, rows, failures = {}, [], []
     # Reuse successful verified details across overlapping catalogue sections.
     shared_detail_cache = {}
@@ -86,6 +89,8 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                                  detail_cache=shared_detail_cache)
             else:
                 result = crawler(retrying, SECTIONS[section], section, max_pages=max_pages)
+            if result is None:
+                raise RuntimeError('MTS crawler returned None before creating CatalogResult; check deployed scrapers/mts_store_catalog_v4.py (possible truncated or malformed upload)')
             row = {'section': section, 'pages': result.pages, 'cards': result.cards,
                    'priced': len(result.products), 'issues': [str(x) for x in result.issues],
                    'incomplete': bool(result.incomplete),
@@ -121,8 +126,3 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                'total_unique_products': len(merged['selected']) if merged else 0,
                'duplicates_removed': merged['duplicates_removed'] if merged else 0,
                'conflicts_excluded': merged['conflicts_excluded'] if merged else [],
-               'ready_to_commit': not failures and merged is not None and bool(merged['selected']),
-               'coverage_verified': False,
-               'note': 'All configured sections checked; unlisted leaf categories may exist.'}
-    emit('FULL_STORE_SUMMARY ' + json.dumps({k:v for k,v in summary.items() if k != 'sections'}, ensure_ascii=False))
-    return merged, summary
