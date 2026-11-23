@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import traceback
 import unicodedata
 from collections import defaultdict
 from decimal import Decimal
@@ -109,6 +110,7 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
             else:
                 results[section] = result
         except Exception as exc:
+            emit('MTS_EXCEPTION_TRACEBACK ' + traceback.format_exc())
             row = {'section': section, 'error': f'{type(exc).__name__}: {exc}'}
             failures.append(f'{section}: {row["error"]}')
         rows.append(row)
@@ -124,23 +126,3 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                'note': 'All configured sections checked; unlisted leaf categories may exist.'}
     emit('FULL_STORE_SUMMARY ' + json.dumps({k:v for k,v in summary.items() if k != 'sections'}, ensure_ascii=False))
     return merged, summary
-
-
-def main():
-    p = argparse.ArgumentParser(description='MTS full-store preview only; no DB writes')
-    p.add_argument('--max-pages', type=int, default=100)
-    p.add_argument('--delay', type=float, default=float(os.getenv('SCRAPER_DELAY_SECONDS', '2')))
-    p.add_argument('--json', help='Write preview report, no DB write')
-    args = p.parse_args()
-    merged, summary = collect_full_store(max_pages=args.max_pages, delay=args.delay)
-    if args.json:
-        with open(args.json, 'w', encoding='utf-8') as f:
-            json.dump({**summary, 'preview': [
-                {'sku': v['item'].sku, 'name':v['item'].name,'price':str(v['item'].price),
-                 'url':v['url'],'category':v['section']} for v in (merged or {'selected':{}})['selected'].values()]},
-                f, ensure_ascii=False, indent=2)
-        print('REPORT ' + args.json, flush=True)
-    return 0 if summary['ready_to_commit'] else 2
-
-if __name__ == '__main__':
-    raise SystemExit(main())
