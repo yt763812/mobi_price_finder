@@ -14,6 +14,8 @@ from scrapers.mts import CardsParser, read_price
 from scrapers.mts_crawl import PaginationLinks, page_number
 from scrapers.mts_modern import discover_cards, detail_offer
 
+CRAWLER_VERSION = "mts-v3.2-verified-return-20261123"
+
 
 def valid_store_product_url(url, catalogue_url):
     """Permit cross-subsection product links on MTS, never external/navigational links."""
@@ -123,6 +125,4 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         raise ValueError('Invalid crawl limits')
     if not 1 <= detail_workers <= 6:
         raise ValueError('detail_workers must be 1..6')
-    # Shared across sections in one run; bounded concurrency, no unbounded fanout.
-    detail_cache = detail_cache if detail_cache is not None else {}
-    cache_lock = Lock()
+    print(f'MTS_CRAWLER_ENTER {CRAWLER_VERSION} section={category}', flush=True)
