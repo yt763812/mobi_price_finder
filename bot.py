@@ -467,6 +467,7 @@ async def prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"\n{i}. {offer['original_name']}\n"
             f"💰 {price}\n"
+            + _wholesale_line(offer)
             + (f"{details}\n" if details else '')
             + f"🕒 {date} · {freshness}"
         )
@@ -515,8 +516,8 @@ async def show_pending(message, context):
 
 
 
-EXCEL_FIELDS = ('name', 'price', 'brand', 'color', 'region', 'category')
-EXCEL_FIELD_NAMES = {'name': 'Название товара', 'price': 'Цена', 'brand': 'Бренд',
+EXCEL_FIELDS = ('name', 'price', 'wholesale_price', 'brand', 'color', 'region', 'category')
+EXCEL_FIELD_NAMES = {'name': 'Название товара', 'price': 'Цена', 'wholesale_price': 'Оптовая цена', 'brand': 'Бренд',
                      'color': 'Цвет', 'region': 'Регион', 'category': 'Категория'}
 
 
@@ -644,6 +645,9 @@ async def excel_manual_callback(query, context, action):
         mapping = item.get('mapping') or {}
         if mapping.get('name') is None or mapping.get('price') is None or mapping['name'] == mapping['price']:
             await query.message.reply_text('❌ Укажи разные столбцы товара и цены.')
+            return
+        if mapping.get('wholesale_price') is not None and mapping['wholesale_price'] in (mapping['name'], mapping['price']):
+            await query.message.reply_text('❌ Оптовая цена должна быть в отдельном столбце.')
             return
         info = inspect_mapping(item.get('data', stage['data']), item['sheet'], mapping, item.get('header_row', 0))
         if not info['valid'] or info['truncated']:
@@ -1050,7 +1054,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     batch, missing = extract_xlsx(selected.get('data', staged['data']), selected['sheet'], selected['mapping'], selected['header_row'], default_brand=_supplier_default_brand(sid))
                     extracted.extend(batch)
                     skipped += missing
-                parsed = [(parse_product(name), price) for name, price in extracted]
+                parsed = [(parse_product(row[0]), *row[1:]) for row in extracted]
                 report = save_excel_rows(sid, parsed, staged['currency'], staged['tax_status'])
                 return report, selected_items, skipped
             report, selected_items, skipped = await asyncio.to_thread(_process_import)
@@ -1520,6 +1524,18 @@ def _screen_diagonal_keyboard(token, matches, selected=None):
     return InlineKeyboardMarkup(rows)
 
 
+def _wholesale_line(offer, rate=None):
+    raw = offer.get('wholesale_price')
+    if raw is None:
+        return ''
+    currency = (offer.get('currency') or '').upper()
+    amount = Decimal(str(raw))
+    label = f"{amount:.2f} {currency or 'валюта не указана'}"
+    if currency == 'USD' and rate is not None and rate > 0:
+        label += f" ({(amount * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)} BYN)"
+    return f"📦 Оптовая цена: {label}\n"
+
+
 def format_offer(offer, index, rate=None):
     parsed = parse_product(offer['original_name'])
     def get(key):
@@ -1549,6 +1565,7 @@ def format_offer(offer, index, rate=None):
     return (f"{index}. 🏪 {offer['supplier_name']}\n"
             f"{offer['original_name']}\n"
             f"💰 {price_label}\n"
+            f"{_wholesale_line(offer, rate)}"
             f"{specs}")
 
 def _interpret_search_query(query_text):
