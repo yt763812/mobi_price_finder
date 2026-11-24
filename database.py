@@ -77,6 +77,7 @@ def init_db():
             cur.execute("""INSERT INTO app_settings (key, value)
                 VALUES ('usd_byn_rate', '3.01') ON CONFLICT (key) DO NOTHING""")
             cur.execute("ALTER TABLE offers ADD COLUMN IF NOT EXISTS ram_gb INTEGER")
+            cur.execute("ALTER TABLE offers ADD COLUMN IF NOT EXISTS wholesale_price NUMERIC(16,2) CHECK (wholesale_price IS NULL OR wholesale_price > 0)")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_offers_model
                 ON offers(model, storage_gb, color)
@@ -175,6 +176,7 @@ def save_offer(supplier_id, product, price, currency=None, tax_status="unknown")
                     warnings = EXCLUDED.warnings,
                     ram_gb = EXCLUDED.ram_gb,
                     price = EXCLUDED.price,
+                    wholesale_price = NULL,
                     currency = EXCLUDED.currency,
                     tax_status = EXCLUDED.tax_status,
                     updated_at = now()
@@ -219,7 +221,7 @@ def get_supplier_offers(supplier_id, limit=20):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT o.original_name, o.model, o.storage_gb, o.color,
-                       o.region, o.sim, o.price, o.currency, o.tax_status,
+                       o.region, o.sim, o.price, o.wholesale_price, o.currency, o.tax_status,
                        o.updated_at,
                        (o.updated_at >= now() - s.validity_hours * INTERVAL '1 hour')
                            AS is_fresh
@@ -357,7 +359,16 @@ def _prepare_import(rows):
     """Keep distinct original supplier lines; collapse only exact repeated names."""
     unique = {}
     rejected = []
-    for product, raw_price in rows:
+    for row in rows:
+        product, raw_price = row[:2]
+        wholesale = None
+        if len(row) > 2 and row[2] is not None:
+            try:
+                candidate = Decimal(str(row[2]).replace(',', '.'))
+                if candidate.is_finite() and Decimal('0.005') <= candidate <= Decimal('99999999999999.99'):
+                    wholesale = candidate
+            except (ValueError, ArithmeticError):
+                pass
         try:
             amount = Decimal(str(raw_price).replace(',', '.'))
             if not amount.is_finite() or amount <= 0:
@@ -375,7 +386,7 @@ def _prepare_import(rows):
             continue
         signature = hashlib.sha256(original.encode('utf-8')).hexdigest()
         if signature not in unique or amount < unique[signature][1]:
-            unique[signature] = (product, amount)
+            unique[signature] = (product, amount, wholesale)
     return unique, rejected
 
 
@@ -403,17 +414,17 @@ def _replace_supplier_offers(supplier_id, rows, currency=None, tax_status=None):
             insert_sql = """
                 INSERT INTO offers (supplier_id, signature, original_name, brand, model,
                     storage_gb, color, region, sim, condition_tags, warnings, ram_gb,
-                    price, currency, tax_status)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s)
+                    price, currency, tax_status, wholesale_price)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s)
             """
             def insert_parameters():
-                for signature, (product, amount) in unique.items():
+                for signature, (product, amount, wholesale) in unique.items():
                     yield (supplier_id, signature, product['original'], product.get('brand'),
                            product.get('model'), product.get('storage_gb'), product.get('color'),
                            product.get('region'), product.get('sim'),
                            json.dumps(product.get('condition') or [], ensure_ascii=False),
                            json.dumps(product.get('warnings') or [], ensure_ascii=False),
-                           product.get('ram_gb'), amount, currency, tax_status)
+                           product.get('ram_gb'), amount, currency, tax_status, wholesale)
             batch = []
             for params in insert_parameters():
                 batch.append(params)
@@ -427,7 +438,7 @@ def _replace_supplier_offers(supplier_id, rows, currency=None, tax_status=None):
     return {'saved': len(unique), 'skipped': len(rejected),
             'duplicates': len(rows) - len(unique) - len(rejected),
             'rejected': rejected[:5],
-            'unrecognized_rows': sum(not p.get('model') for p, _ in unique.values())}
+            'unrecognized_rows': sum(not p.get('model') for p, _, _ in unique.values())}
 
 
 def save_price_list(supplier_id, rows):
