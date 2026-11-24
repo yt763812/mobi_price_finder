@@ -40,6 +40,8 @@ from product_parser import parse_product, section_brand, contextual_name
 
 NAME_HEADERS = ('модель', 'номенклатура', 'наименование', 'название', 'название товара', 'раздел / наименование', 'товар', 'product', 'model', 'item', 'description', 'описание', 'продукт')
 PRICE_HEADERS = ('цена', 'закупочная цена', 'опт', 'оптовая цена', 'price', 'wholesale', 'dealer price', 'цена $ usd', 'цена usd', 'цена $', 'цена rub', 'цена руб', 'цена без ндс', 'цена с ндс', 'цена розничная', 'цена прайса с ндс', 'алтерн-цена без ндс', 'алтерн-цена с ндс', 'предоплата byn c ндс', 'предоплата byn с ндс', 'предоплата с ндс', 'кредит byn с ндс')
+WHOLESALE_HEADERS = ('опт', 'оптовая цена', 'цена опт', 'цена оптовая', 'оптовая', 'wholesale', 'wholesale price', 'dealer price', 'опт. цена', 'цена для опта')
+RETAIL_HEADERS = ('розничная цена', 'цена розничная', 'розница', 'retail', 'retail price', 'цена', 'price')
 BRAND_HEADERS = ('бренд', 'брэнд', 'brand', 'производитель')
 COLOR_HEADERS = ('цвет', 'color', 'colour')
 REGION_HEADERS = ('происхождение', 'регион', 'страна', 'region')
@@ -250,6 +252,12 @@ def inspect_xlsx(data, tax_status='with_vat'):
                 # Prefer descriptive product names over SKU-like 'Продукт' columns.
                 names.sort(key=lambda i: (0 if _header(row[i]) in ('описание', 'наименование', 'название товара', 'название') else 1, i))
                 prices = _preferred_price(row, tax_status)
+                wholesale = _indices(row, WHOLESALE_HEADERS)
+                retail = _indices(row, RETAIL_HEADERS)
+                if wholesale and retail:
+                    prices = retail + [i for i in prices if i not in retail]
+                elif wholesale and not prices:
+                    prices = wholesale
                 brands = _indices(row, BRAND_HEADERS)
                 categories = _indices(row, CATEGORY_HEADERS)
                 colors = _indices(row, COLOR_HEADERS)
@@ -257,6 +265,7 @@ def inspect_xlsx(data, tax_status='with_vat'):
                 if mapping is None and names and prices:
                     header_row = row_num
                     mapping = {'name': names[0], 'price': prices[0],
+                               'wholesale_price': wholesale[0] if len(wholesale) == 1 and wholesale[0] != prices[0] else None,
                                'brand': brands[0] if brands else None,
                                'category': categories[0] if categories else None,
                                'color': colors[0] if colors else None,
@@ -273,7 +282,7 @@ def inspect_xlsx(data, tax_status='with_vat'):
                         chosen_label in descriptive
                         and all(_header(row[i]) not in preferred for i in names[1:])
                     )
-                    ambiguous = name_ambiguous or (
+                    ambiguous = name_ambiguous or (len(wholesale) > 1) or (len(retail) > 1 and bool(wholesale)) or (
                         len(prices) > 1 and _header(row[prices[0]]) == _header(row[prices[1]])
                     )
                     break
@@ -312,7 +321,8 @@ def inspect_xlsx(data, tax_status='with_vat'):
                     if extra and extra.casefold() not in full_name.casefold():
                         full_name += " " + extra
                 if len(samples) < 4:
-                    samples.append(f'{full_name[:85]} — {price}')
+                    bulk = _price(val(mapping.get('wholesale_price')))
+                    samples.append(f'{full_name[:85]} — {price}' + (f' / опт {bulk}' if bulk is not None else ''))
                     parsed = parse_product(full_name)
                     parsed_samples.append({
                         'model': parsed.get('model') or 'По исходному названию',
@@ -373,7 +383,8 @@ def extract_xlsx(data, sheet_name, mapping, header_row, default_brand=None):
                 extra = _clean(val(key))
                 if extra and extra.casefold() not in full_name.casefold():
                     full_name += ' ' + extra
-            rows.append((full_name, amount))
+            wholesale = _price(val('wholesale_price')) if mapping.get('wholesale_price') not in (None, mapping.get('price'), mapping.get('name')) else None
+            rows.append((full_name, amount, wholesale) if wholesale is not None else (full_name, amount))
         return rows, skipped
     finally:
         wb.close()
@@ -429,7 +440,8 @@ def inspect_mapping(data, sheet_name, mapping, header_row):
                 continue
             valid += 1
             if len(samples) < 3:
-                samples.append(f'{name[:65]} — {price}')
+                bulk = _price(v('wholesale_price'))
+                samples.append(f'{name[:65]} — {price}' + (f' / опт {bulk}' if bulk is not None else ''))
         return {'valid': valid, 'named': named, 'no_price': no_price, 'samples': samples, 'truncated': False}
     finally:
         wb.close()
