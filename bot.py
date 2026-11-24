@@ -16,7 +16,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
-    ContextTypes, MessageHandler, filters,
+    ContextTypes, MessageHandler, TypeHandler, filters,
 )
 from myfin_rate import MYFIN_URL, fetch_bsb_usd_sale
 from mts_daily_scheduler import post_init as mts_post_init
@@ -252,6 +252,58 @@ async def auto_draft_status(message, draft, context):
     sent = await message.reply_text(body, reply_markup=auto_draft_keyboard(draft))
     draft['status_chat_id'] = sent.chat_id
     draft['status_message_id'] = sent.message_id
+
+
+PRICE_MESSAGE_TTL = 10
+
+
+async def track_chat_activity(update, context):
+    """Do not reopen the menu over a newer user interaction."""
+    if allowed(update) and update.effective_chat and (update.message or update.callback_query):
+        context.user_data.setdefault('cleanup_activity', {})[update.effective_chat.id] = update.update_id
+
+
+async def _delete_price_messages(bot, chat_id, message_ids):
+    for message_id in dict.fromkeys(message_ids):
+        if message_id is None:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError as exc:
+            logger.info('Price cleanup: cannot delete %s/%s: %s', chat_id, message_id, exc)
+
+
+def schedule_price_input_cleanup(message, context):
+    # In groups Telegram may require administrator rights to delete user messages.
+    async def cleanup():
+        await asyncio.sleep(PRICE_MESSAGE_TTL)
+        await _delete_price_messages(context.bot, message.chat_id, [message.message_id])
+    context.application.create_task(cleanup())
+
+
+def schedule_draft_completion(update, context, draft, sent):
+    chat_id = sent.chat_id
+    ids = [sent.message_id]
+    if draft.get('status_chat_id') == chat_id:
+        ids.append(draft.get('status_message_id'))
+    ids.append(update.callback_query.message.message_id)
+    activity = update.update_id
+    show_onliner = onliner_ui.can_launch(update)
+
+    async def cleanup():
+        await asyncio.sleep(PRICE_MESSAGE_TTL)
+        await _delete_price_messages(context.bot, chat_id, ids)
+        if context.user_data.get('cleanup_activity', {}).get(chat_id) != activity:
+            return
+        if context.user_data.get('auto_draft') or context.user_data.get('parts'):
+            return
+        current = context.user_data.get('mode', 'auto')
+        labels = {'auto': 'Авто', 'search': 'Поиск', 'import': 'Загрузка прайса'}
+        await context.bot.send_message(chat_id, f"Режим: {labels.get(current, 'Авто')}. Выбери нужный:", reply_markup=mode_keyboard())
+        if show_onliner:
+            await context.bot.send_message(chat_id, '🛍 Управление ассортиментом Onlíner', reply_markup=onliner_ui.panel_keyboard())
+
+    context.application.create_task(cleanup(), update=update)
 
 
 def mode_keyboard():
@@ -783,7 +835,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except TelegramError:
                 pass
-            await query.message.reply_text('❌ Черновик отменён. Сохранённый прайс не изменён.')
+            sent = await query.message.reply_text('❌ Черновик отменён. Сохранённый прайс не изменён.')
+            schedule_draft_completion(update, context, draft, sent)
         elif op == 'save':
             sid = context.user_data.get('supplier_id')
             if sid != draft['supplier_id'] or not get_supplier(sid):
@@ -807,11 +860,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except TelegramError:
                 pass
-            await query.message.reply_text(
+            sent = await query.message.reply_text(
                 f"✅ Общий прайс сохранён!\nСообщений: {len(draft['messages'])}\n"
                 f"Конфигураций: {summary['saved']}\nДубли: {summary['duplicates']}\n"
                 f"Пропущено: {summary['skipped']}\nСтарый прайс поставщика заменён."
             )
+            schedule_draft_completion(update, context, draft, sent)
         return
     if action == 'parts:start':
         sid = context.user_data.get('supplier_id')
@@ -896,6 +950,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text('Сначала выбери поставщика:', reply_markup=keyboard_suppliers())
     elif action.startswith('decide:'):
         raw = context.user_data.pop('undecided_text', None)
+        source_message = context.user_data.pop('undecided_message', None)
         if not raw:
             await query.message.reply_text('Сообщение для обработки уже отсутствует. Пришли его ещё раз.')
             return
@@ -917,6 +972,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.reply_text(str(exc))
                     return
                 await auto_draft_status(query.message, draft, context)
+                if source_message and source_message.chat_id == query.message.chat_id:
+                    schedule_price_input_cleanup(source_message, context)
+                schedule_price_input_cleanup(query.message, context)
     elif action == 'supplier:new':
         context.user_data.pop('await_rename_id', None)
         context.user_data['await_name'] = True
@@ -1183,6 +1241,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if added:
             await auto_draft_status(update.effective_message, draft, context)
+            schedule_price_input_cleanup(update.effective_message, context)
         else:
             await update.effective_message.reply_text('Такое сообщение уже есть в черновике.', reply_markup=auto_draft_keyboard(draft))
         return
@@ -1223,8 +1282,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(str(exc))
             return
         await auto_draft_status(update.effective_message, draft, context)
+        schedule_price_input_cleanup(update.effective_message, context)
     elif len(rows) == 1 or ('\n' in text and not rows):
         context.user_data['undecided_text'] = text
+        context.user_data['undecided_message'] = update.effective_message
         await update.effective_message.reply_text('Это поиск товара или загрузка прайса?', reply_markup=decision_keyboard())
     else:
         await run_search(update.effective_message, text, context)
@@ -1840,6 +1901,7 @@ def main():
     onliner_store.init()
     logger.info('PostgreSQL: подключение успешно, таблицы готовы')
     app = ApplicationBuilder().token(token).post_init(combined_post_init).build()
+    app.add_handler(TypeHandler(Update, track_chat_activity), group=-1)
     for command, handler in [('start', start), ('myid', myid), ('suppliers', suppliers),
                              ('addsupplier', addsupplier), ('settings', settings), ('prices', prices),
                              ('find', find), ('menu', menu), ('mode', mode)]:
