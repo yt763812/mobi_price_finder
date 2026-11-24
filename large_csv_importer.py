@@ -56,10 +56,10 @@ def import_large_csv(path, supplier_id, expected_tax_status=None):
                 signature text, original_name text, brand text, model text,
                 storage_gb integer, color text, region text, sim text,
                 condition_tags jsonb, warnings jsonb, ram_gb integer,
-                price numeric(16,2)
+                price numeric(16,2), wholesale_price numeric(16,2)
             ) ON COMMIT DROP''')
             with cur.copy('''COPY csv_stage (signature, original_name, brand, model,
-                storage_gb, color, region, sim, condition_tags, warnings, ram_gb, price)
+                storage_gb, color, region, sim, condition_tags, warnings, ram_gb, price, wholesale_price)
                 FROM STDIN''') as copier:
                 for record in _rows(path):
                     total += 1
@@ -75,6 +75,16 @@ def import_large_csv(path, supplier_id, expected_tax_status=None):
                     except (ValueError, InvalidOperation):
                         skipped += 1
                         continue
+                    wholesale = None
+                    for key, value in record.items():
+                        if key and key.strip().casefold() in ('оптовая цена', 'цена оптовая', 'опт', 'цена опт', 'wholesale price', 'wholesale'):
+                            try:
+                                candidate = Decimal((value or '').strip().replace(' ', '').replace('\xa0', '').replace(',', '.'))
+                                if candidate.is_finite() and Decimal('0.005') <= candidate <= Decimal('99999999999999.99'):
+                                    wholesale = candidate
+                            except (InvalidOperation, ValueError):
+                                pass
+                            break
                     item = parse_product(name)
                     valid += 1
                     copier.write_row((hashlib.sha256(name.encode('utf-8')).hexdigest(), name,
@@ -83,7 +93,7 @@ def import_large_csv(path, supplier_id, expected_tax_status=None):
                         item.get('region'), item.get('sim'),
                         json.dumps(item.get('condition') or [], ensure_ascii=False),
                         json.dumps(item.get('warnings') or [], ensure_ascii=False),
-                        item.get('ram_gb'), amount))
+                        item.get('ram_gb'), amount, wholesale))
             if total == 0 or valid == 0 or valid / total < 0.5:
                 raise ValueError('CSV пустой или слишком много некорректных строк; старый прайс сохранён.')
             # DISTINCT ON mirrors existing logic: same exact name -> cheapest price.
@@ -95,10 +105,10 @@ def import_large_csv(path, supplier_id, expected_tax_status=None):
             cur.execute('DELETE FROM offers WHERE supplier_id=%s', (supplier_id,))
             cur.execute('''INSERT INTO offers (supplier_id, signature, original_name, brand, model,
                     storage_gb, color, region, sim, condition_tags, warnings, ram_gb,
-                    price, currency, tax_status)
+                    price, currency, tax_status, wholesale_price)
                 SELECT %s, signature, original_name, brand, model, storage_gb, color,
                     region, sim, condition_tags, warnings, ram_gb,
-                    price, 'BYN', %s FROM csv_distinct''',
+                    price, 'BYN', %s, wholesale_price FROM csv_distinct''',
                 (supplier_id, supplier['tax_status']))
             cur.execute('UPDATE suppliers SET last_price_import_at=now() WHERE id=%s', (supplier_id,))
     return {'total': total, 'saved': saved, 'skipped': skipped, 'duplicates': valid - saved}
