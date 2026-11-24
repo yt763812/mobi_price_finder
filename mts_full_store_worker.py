@@ -18,6 +18,9 @@ def run_full_store(max_pages=100, report=None):
         try:
             # Short diagnostic mode: no supplier snapshot can be written, even
             # when MTS_FULL_STORE_COMMIT=1 by mistake.
+            if os.getenv('MTS_FAST_PROBE', '0') == '1':
+                from mts_fast_probe import run_fast_probe
+                return run_fast_probe(emit=emit)
             if os.getenv('MTS_DIAGNOSTIC_ONLY', '0') == '1':
                 from mts_diagnostic import run_diagnostic
                 return run_diagnostic(emit=emit)
