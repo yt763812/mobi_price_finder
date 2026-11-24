@@ -55,7 +55,8 @@ def _product_link(href, base):
         return None
     parts = [part for part in u.path.split('/') if part]
     # A product is nested below its category (not a category itself).
-    return url if len(parts) >= 3 and parts[-1].lower() not in ('catalog','index.php') else None
+    return url if ((len(parts) >= 3 or (len(parts) == 2 and parts[0] == 'terminals'))
+                   and parts[-1].lower() not in ('catalog', 'index.php')) else None
 
 
 def discover_cards(html: str, page_url: str) -> list[ModernCard]:
