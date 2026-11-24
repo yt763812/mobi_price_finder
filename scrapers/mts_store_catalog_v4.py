@@ -17,7 +17,7 @@ from scrapers.mts import CardsParser, read_price
 from scrapers.mts_crawl import PaginationLinks, page_number
 from scrapers.mts_modern import discover_cards, detail_offer, _product_link
 
-CRAWLER_VERSION = "mts-v3.7-preorder-pages-20261124"
+CRAWLER_VERSION = "mts-v3.8-preorder-cta-20261124"
 
 
 def valid_store_product_url(url, catalogue_url):
@@ -125,41 +125,42 @@ def _verify_conflict(fetcher, offer, alternatives):
 
 
 def discover_catalogue_preorders(html, page_url):
-    """Find explicitly marked preorder product cards absent from priced discovery.
+    """Identify product tiles by an explicit PREORDER purchase action.
 
-    Do not treat generic no-price links, banners, category navigation or product
-    recommendations as preorders. The marker must belong to the same compact
-    local card as the product link. This is catalogue evidence, not an invented
-    price. Returns URL -> name; products are NEVER persisted from this mapping.
+    MTS currently displays a BYN price on some preorder-only items, so price
+    visibility is NOT proof an item is purchasable. Only accept an action in a
+    compact, single-product tile; never match a page-wide advertisement.
     """
     soup = BeautifulSoup(html, 'lxml')
     main = soup.select_one('main') or soup.select_one('[role=main]') or soup
     found = {}
-    for anchor in main.select('a[href]'):
-        name = ' '.join(anchor.get_text(' ', strip=True).split())
-        if not (7 <= len(name) <= 180):
+    for action in main.find_all(['button', 'input', 'a', 'span', 'div']):
+        if action.name == 'input':
+            label = action.get('value', '')
+        else:
+            # Divs can encompass entire pages; permit only small leaf labels.
+            if action.find(['button', 'input', 'a', 'span', 'div']):
+                continue
+            label = action.get_text(' ', strip=True)
+        if not re.fullmatch(r'\s*предзаказ(?:ать)?\s*', str(label), re.I):
             continue
-        url = _product_link(anchor.get('href', ''), page_url)
-        if not url or not valid_store_product_url(url, page_url):
-            continue
-        for ancestor in list(anchor.parents)[:7]:
+        for ancestor in list(action.parents)[:10]:
             if ancestor is main or ancestor.name in ('body', 'html'):
                 break
-            text = ' '.join(ancestor.get_text(' ', strip=True).split())
-            if len(text) > 900:
+            text = ancestor.get_text(' ', strip=True)
+            if len(text) > 2500:
                 break
-            if not re.search(r'(?<!\w)предзаказ(?:ать|у)?(?!\w)', text, re.I):
-                continue
-            # Require that this is a local PRODUCT card, not a navigation panel,
-            # with the preorder label belonging to this item rather than another.
-            links = {u for a in ancestor.select('a[href]')
-                     if (u := _product_link(a.get('href', ''), page_url))}
-            if len(links) != 1 or url not in links:
-                continue
-            # A real current purchase price and buy button take precedence.
-            # Those products go through the existing verified detail parser.
-            found[url] = name
-            break
+            candidates = {}
+            for a in ancestor.select('a[href]'):
+                name = ' '.join(a.get_text(' ', strip=True).split())
+                if not 7 <= len(name) <= 180:
+                    continue
+                url = _product_link(a.get('href', ''), page_url)
+                if url and valid_store_product_url(url, page_url):
+                    candidates.setdefault(url, name)
+            if len(candidates) == 1:
+                found.update(candidates)
+                break
     return found
 
 
@@ -289,10 +290,12 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             # A catalogue page can consist entirely of "Предзаказ" cards.
             # The priced-card selector deliberately excludes those cards.
             preorders = discover_catalogue_preorders(html, page_url)
-            priced_urls = {urljoin(page_url, c.url or '') for c in parser.cards if c.url}
-            priced_urls.update(c.url for c in modern)
-            preorders = {url: name for url, name in preorders.items()
-                         if url not in priced_urls}
+            # CTA status overrides any displayed BYN amount: MTS can show an
+            # indicative price even though the only action is "Предзаказ".
+            preorder_urls = set(preorders)
+            parser.cards = [c for c in parser.cards
+                            if urljoin(page_url, c.url or '') not in preorder_urls]
+            modern = [c for c in modern if c.url not in preorder_urls]
             if not parser.cards and not modern and not preorders:
                 # A terminal blank page is valid only when it follows consecutive,
                 # populated pages and there is independent evidence it is the end.
