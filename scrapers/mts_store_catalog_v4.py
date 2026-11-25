@@ -17,7 +17,7 @@ from scrapers.mts import CardsParser, read_price
 from scrapers.mts_crawl import PaginationLinks, page_number
 from scrapers.mts_modern import discover_cards, detail_offer, _product_link
 
-CRAWLER_VERSION = "mts-v3.8-preorder-cta-20261124"
+CRAWLER_VERSION = "mts-v3.9-recheck-coverage-20261125"
 
 
 def valid_store_product_url(url, catalogue_url):
@@ -206,6 +206,18 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
     # A bounded queue prevents uncontrolled fan-out and preserves shared rate limiting.
     queued_detail_keys = set()
     futures = {}
+    # Do not turn transient detail timeouts into permanent crawl failures until
+    # the whole catalogue has been scanned and a delayed recovery was tried.
+    transient_failures = {}
+    recovery_attempts = max(0, min(2, int(os.getenv('MTS_FAILED_DETAIL_RECHECKS', '1'))))
+
+    def is_transient_detail_error(error):
+        if not error or not error.startswith('detail HTTP/parse failure:'):
+            return False
+        return bool(re.search(
+            r'timed out|timeout|HTTP Error (?:408|429|500|502|503|504)|'
+            r'connection reset|RemoteDisconnected|temporar|incomplete read|'
+            r'network is unreachable|connection aborted|connection refused', error, re.I))
 
     def get_verified(card):
         url = card.url
@@ -245,7 +257,10 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         if error == 'MTS_PREORDER_SKIP':
             preorder_skipped += 1
         elif error is not None:
-            issues.append((sku or card.url, error))
+            if is_transient_detail_error(error) and recovery_attempts:
+                transient_failures[key] = (card, error)
+            else:
+                issues.append((sku or card.url, error))
         else:
             products[key] = CatalogOffer(sku, card.name, card.url, exact,
                                          'BYN', False, '', '')
@@ -437,6 +452,33 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             drain_details(block=True)
     finally:
         executor.shutdown(wait=True)
+    # A later retry is useful when a transient server slowdown affected an
+    # otherwise complete catalogue. Retry only network-type failures; malformed
+    # prices and title mismatches remain genuine errors and are never hidden.
+    if transient_failures:
+        print(f'MTS_DETAIL_RECHECK_START section={category} '
+              f'failed={len(transient_failures)} rounds={recovery_attempts}', flush=True)
+        for round_no in range(1, recovery_attempts + 1):
+            if not transient_failures:
+                break
+            remaining = {}
+            for key, (card, previous_error) in transient_failures.items():
+                sku, exact, error = get_verified(card)
+                if error is None and sku and isinstance(exact, Decimal) and exact.is_finite() and exact > 0:
+                    products[key] = CatalogOffer(sku, card.name, card.url, exact,
+                                                 'BYN', False, '', '')
+                    print(f'MTS_DETAIL_RECOVERED section={category} round={round_no} '
+                          f'url={card.url}', flush=True)
+                elif error == 'MTS_PREORDER_SKIP':
+                    preorder_skipped += 1
+                else:
+                    error = error or 'detail returned missing/invalid SKU or price'
+                    remaining[key] = (card, error)
+            transient_failures = remaining
+            print(f'MTS_DETAIL_RECHECK_ROUND section={category} round={round_no} '
+                  f'unresolved={len(transient_failures)}', flush=True)
+        for card, error in transient_failures.values():
+            issues.append((card.url, f'unresolved after deferred recheck: {error}'))
     if expected_page_count is not None and len(visited) < expected_page_count:
         incomplete = True
         pagination_anomalies.append(
