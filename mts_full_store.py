@@ -93,6 +93,7 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                 raise RuntimeError('MTS crawler returned None before creating CatalogResult; check deployed scrapers/mts_store_catalog_v4.py (possible truncated or malformed upload)')
             row = {'section': section, 'pages': result.pages, 'cards': result.cards,
                    'priced': len(result.products), 'preorders_skipped': getattr(result, 'preorder_skipped', 0),
+                   'graded_skipped': getattr(result, 'graded_skipped', 0),
                    'issues': [str(x) for x in result.issues],
                    'incomplete': bool(result.incomplete),
                    'conflicts': len(result.conflicts or []),
