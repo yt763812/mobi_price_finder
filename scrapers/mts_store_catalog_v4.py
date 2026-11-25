@@ -17,7 +17,7 @@ from scrapers.mts import CardsParser, read_price
 from scrapers.mts_crawl import PaginationLinks, page_number
 from scrapers.mts_modern import discover_cards, detail_offer, _product_link
 
-CRAWLER_VERSION = "mts-v3.9-recheck-coverage-20261125"
+CRAWLER_VERSION = "mts-v4.0-graded-exclusions-20261125"
 
 
 def valid_store_product_url(url, catalogue_url):
@@ -60,6 +60,7 @@ class CatalogResult:
     pagination_probe_count: int = 0
     pagination_anomalies: list = None
     preorder_skipped: int = 0
+    graded_skipped: int = 0
 
 
 class _VisiblePrices(HTMLParser):
@@ -164,6 +165,37 @@ def discover_catalogue_preorders(html, page_url):
     return found
 
 
+
+# Only explicitly labelled condition-grade product slugs are excluded.
+# Do not filter all Apple products, and do not interpret generic letters A/B
+# or a model name as a condition grade.
+_GRADE_SLUG = re.compile(r'(?:^|-)greyd-(?:a(?:-plus)?|b)(?=-|$)', re.I)
+
+
+def is_graded_device_url(url):
+    """Return True for a clearly grade-marked product URL (A, A+, B)."""
+    slug = urlsplit(url).path.rstrip('/').rsplit('/', 1)[-1]
+    return bool(_GRADE_SLUG.search(slug))
+
+
+def discover_catalogue_graded(html, page_url):
+    """Find grade-marked product links without requiring a purchase button.
+
+    This is an exclusion-only classifier: these links never enter the price
+    queue and do not become saleable products.
+    """
+    soup = BeautifulSoup(html, 'lxml')
+    main = soup.select_one('main') or soup.select_one('[role=main]') or soup
+    found = {}
+    for anchor in main.select('a[href]'):
+        name = ' '.join(anchor.get_text(' ', strip=True).split())
+        if not 7 <= len(name) <= 180:
+            continue
+        url = _product_link(anchor.get('href', ''), page_url)
+        if url and valid_store_product_url(url, page_url) and is_graded_device_url(url):
+            found.setdefault(url, name)
+    return found
+
 def catalogue_page_url(catalogue_url, number):
     """Only construct safe sequential ?page=N links on the same catalogue route."""
     parts = urlsplit(catalogue_url)
@@ -193,7 +225,9 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
     conflicts = []
     cards_total = 0
     preorder_skipped = 0
+    graded_skipped = 0
     seen_preorder_urls = set()
+    seen_graded_urls = set()
     incomplete = False
     pagination_probe_count = 0
     pagination_anomalies = []
@@ -305,13 +339,17 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             # A catalogue page can consist entirely of "Предзаказ" cards.
             # The priced-card selector deliberately excludes those cards.
             preorders = discover_catalogue_preorders(html, page_url)
+            graded = discover_catalogue_graded(html, page_url)
+            # A graded preorder is counted once as preorder, not twice.
+            graded_urls = set(graded) - set(preorders)
             # CTA status overrides any displayed BYN amount: MTS can show an
             # indicative price even though the only action is "Предзаказ".
             preorder_urls = set(preorders)
+            excluded_urls = preorder_urls | graded_urls
             parser.cards = [c for c in parser.cards
-                            if urljoin(page_url, c.url or '') not in preorder_urls]
-            modern = [c for c in modern if c.url not in preorder_urls]
-            if not parser.cards and not modern and not preorders:
+                            if urljoin(page_url, c.url or '') not in excluded_urls]
+            modern = [c for c in modern if c.url not in excluded_urls]
+            if not parser.cards and not modern and not preorders and not graded_urls:
                 # A terminal blank page is valid only when it follows consecutive,
                 # populated pages and there is independent evidence it is the end.
                 # An explicit advertised next page inside a known range must NEVER
@@ -337,6 +375,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             page_urls = {urljoin(page_url, c.url or '') for c in parser.cards if c.url}
             page_urls.update(c.url for c in modern)
             page_urls.update(preorders)
+            page_urls.update(graded_urls)
             if page_urls and page_urls.issubset(seen_urls):
                 if expected_page_count is not None and n <= expected_page_count:
                     incomplete = True
@@ -347,14 +386,21 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                 break
             visited.add(n)
             unseen_preorders = set(preorders) - seen_preorder_urls
+            unseen_graded = graded_urls - seen_graded_urls
             seen_preorder_urls.update(unseen_preorders)
+            seen_graded_urls.update(unseen_graded)
             preorder_skipped += len(unseen_preorders)
+            graded_skipped += len(unseen_graded)
             seen_urls.update(page_urls)
-            cards_total += len(parser.cards) + len(modern) + len(unseen_preorders)
+            cards_total += len(parser.cards) + len(modern) + len(unseen_preorders) + len(unseen_graded)
             if unseen_preorders:
                 print(f'MTS_PREORDER_PAGE section={category} page={n} '
                       f'preorders_on_page={len(unseen_preorders)} '
                       f'preorders_total={preorder_skipped}', flush=True)
+            if unseen_graded:
+                print(f'MTS_GRADED_PAGE section={category} page={n} '
+                      f'graded_on_page={len(unseen_graded)} '
+                      f'graded_total={graded_skipped}', flush=True)
             if cards_total > max_products:
                 incomplete = True
                 break
@@ -417,12 +463,13 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             drain_details(block=False)
             print(f'MTS catalog-only {category}: pages={len(visited)}, cards={cards_total}, '
                   f'priced={len(products)}, preorders_skipped={preorder_skipped}, '
-                  f'issues={len(issues)}, pending={len(futures)}, page_seconds={time.monotonic() - started_page:.1f}', flush=True)
+                  f'graded_skipped={graded_skipped}, issues={len(issues)}, pending={len(futures)}, page_seconds={time.monotonic() - started_page:.1f}', flush=True)
             links = PaginationLinks()
             links.feed(html)
             last_page_links = {p for href in links.hrefs
                                if (p := page_number(urljoin(page_url, href), catalogue_url))}
-            last_page_card_count = len(parser.cards) + len(modern) + len(unseen_preorders)
+            last_page_card_count = (len(parser.cards) + len(modern)
+                                    + len(unseen_preorders) + len(unseen_graded))
             for href in links.hrefs:
                 next_url = urljoin(page_url, href)
                 next_n = page_number(next_url, catalogue_url)
@@ -438,7 +485,8 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                 advertised_pages_remain = (expected_page_count is not None
                                            and next_n <= expected_page_count)
                 full_page_without_count = (expected_page_count is None and
-                    (len(parser.cards) >= 18 or len(modern) >= 12))
+                    (len(parser.cards) >= 18 or len(modern) >= 12 or
+                     last_page_card_count >= 12))
                 if (advertised_pages_remain or full_page_without_count) and next_n not in visited:
                     todo.append((next_n, catalogue_page_url(catalogue_url, next_n)))
                     pagination_probe_count += 1
@@ -446,7 +494,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                         pagination_anomalies.append(f'no pagination after full page {n}; probed page {next_n}')
                     print(f'MTS catalog-only {category}: PAGINATION_PROBE page={next_n} '
                           f'advertised_pages={expected_page_count} '
-                          f'preorders={len(unseen_preorders)}', flush=True)
+                          f'preorders={len(unseen_preorders)} graded={len(unseen_graded)}', flush=True)
         # Before checking the final result, process every queued detail response.
         while futures:
             drain_details(block=True)
@@ -484,7 +532,8 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         pagination_anomalies.append(
             f'only {len(visited)} of {expected_page_count} advertised catalogue pages reached')
     # The advertised total includes items without an active selling price.
-    # These count toward coverage ONLY when explicitly detected as preorders.
+    # Confirmed preorders and explicitly graded devices count toward coverage,
+    # while neither kind is written to the price snapshot.
     # Keep a conservative tolerance of less than one normal page for mutable
     # catalogue counters; do not declare a large unexplained gap complete.
     if (advertised_total is not None and first_page_size is not None
@@ -492,7 +541,8 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
         incomplete = True
         pagination_anomalies.append(
             f'advertised {advertised_total} cards, only {cards_total} accounted for '
-            f'(including {preorder_skipped} confirmed preorders)')
+            f'(including {preorder_skipped} confirmed preorders and '
+            f'{graded_skipped} graded exclusions)')
     # One detail request per conflicting URL, not one per product.
     for sku, url, original in conflicts:
         key = hashlib.sha256(url.encode('utf-8')).hexdigest()
@@ -506,6 +556,6 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             products[key] = replace(original, price=resolved)
             print(f'MTS catalog-only {category}: CONFLICT RESOLVED sku={sku} url={url} '
                   f'price={resolved}; {reason}', flush=True)
-    result = CatalogResult(list(products.values()), len(visited), cards_total, issues, incomplete, conflicts, pagination_probe_count, pagination_anomalies, preorder_skipped)
-    print(f'MTS_CRAWLER_RETURN {CRAWLER_VERSION} section={category} pages={result.pages} cards={result.cards} priced={len(result.products)} preorders_skipped={result.preorder_skipped} issues={len(result.issues)} incomplete={result.incomplete}', flush=True)
+    result = CatalogResult(list(products.values()), len(visited), cards_total, issues, incomplete, conflicts, pagination_probe_count, pagination_anomalies, preorder_skipped, graded_skipped)
+    print(f'MTS_CRAWLER_RETURN {CRAWLER_VERSION} section={category} pages={result.pages} cards={result.cards} priced={len(result.products)} preorders_skipped={result.preorder_skipped} graded_skipped={result.graded_skipped} issues={len(result.issues)} incomplete={result.incomplete}', flush=True)
     return result
