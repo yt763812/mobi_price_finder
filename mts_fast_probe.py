@@ -12,7 +12,8 @@ from bs4 import BeautifulSoup
 from scrapers.mts import CardsParser
 from scrapers.mts_modern import discover_cards, _product_link
 from scrapers.mts_store_catalog_v4 import (discover_catalogue_preorders,
-                                           catalogue_page_url, valid_store_product_url)
+                                           catalogue_page_url, valid_store_product_url,
+                                           discover_catalogue_graded)
 from mts_store_audit_v4 import SECTIONS, RetryingFetcher
 
 
@@ -37,10 +38,12 @@ def inspect_page(html, page_url, section, page):
     legacy.feed(html)
     modern = discover_cards(html, page_url) if not legacy.cards else []
     preorders = discover_catalogue_preorders(html, page_url)
+    graded = discover_catalogue_graded(html, page_url)
     legacy_urls = {urljoin(page_url, c.url or '') for c in legacy.cards if c.url}
     modern_urls = {c.url for c in modern}
     priced = legacy_urls | modern_urls
     overlap = priced & set(preorders)
+    graded_urls = set(graded) - set(preorders)
     # Log coverage rather than asserting that all product tiles were discovered.
     flat = re.sub(r'<[^>]*>', ' ', html)
     totals = re.findall(r'Показано\s*[\d\s]+\s*[–—-]\s*[\d\s]+\s*из\s*(\d+)', flat, re.I)
@@ -48,10 +51,12 @@ def inspect_page(html, page_url, section, page):
             'legacy_cards': len(legacy.cards), 'modern_cards': len(modern),
             'preorder_cta_cards': len(preorders),
             'priced_and_preorder_overlap': len(overlap),
-            'unique_detected_products': len(priced | set(preorders)),
+            'graded_excluded_cards': len(graded_urls),
+            'unique_detected_products': len(priced | set(preorders) | graded_urls),
             'has_preorder_text': bool(re.search(r'предзаказ', flat, re.I)),
             'advertised_total': int(totals[-1]) if totals else None,
             'sample_preorder_urls': list(preorders)[:2],
+            'sample_graded_urls': sorted(graded_urls)[:2],
             'sample_product_urls': list(priced - set(preorders))[:2]}
 
 
@@ -80,7 +85,7 @@ def run_coverage_probe(section, *, emit, fetcher):
     base_url = SECTIONS[section]
     emit('MTS_COVERAGE_START ' + json.dumps({
         'section': section, 'no_database_write': True}, ensure_ascii=False))
-    seen_detected, seen_candidates = set(), set()
+    seen_detected, seen_candidates, seen_graded = set(), set(), set()
     failures = []
     advertised = None
     pages = None
@@ -113,18 +118,21 @@ def run_coverage_probe(section, *, emit, fetcher):
             if not legacy.cards:
                 priced.update(c.url for c in discover_cards(html, page_url))
             preorders = set(discover_catalogue_preorders(html, page_url))
-            detected = priced | preorders
+            graded = set(discover_catalogue_graded(html, page_url)) - preorders
+            detected = priced | preorders | graded
             candidates = set(page_link_audit(html, page_url))
             new_detected = detected - seen_detected
             new_candidates = candidates - seen_candidates
             overlooked_candidates = candidates - detected
             seen_detected.update(detected)
             seen_candidates.update(candidates)
+            seen_graded.update(graded)
             if not detected or (len(detected) > 0 and not new_detected):
                 failures.append(n)
             data = {'section': section, 'page': n, 'advertised_pages': pages,
                     'detected': len(detected), 'new_detected': len(new_detected),
-                    'preorders': len(preorders), 'product_like_links': len(candidates),
+                    'preorders': len(preorders), 'graded_excluded': len(graded),
+                    'product_like_links': len(candidates),
                     'new_product_like_links': len(new_candidates),
                     'unclassified_product_like_links': len(overlooked_candidates),
                     'sample_unclassified_urls': sorted(overlooked_candidates)[:3],
@@ -139,6 +147,7 @@ def run_coverage_probe(section, *, emit, fetcher):
                'unique_product_like_links': len(seen_candidates),
                'unexplained_counter_gap': max(0, (advertised or 0) - len(seen_detected)),
                'unclassified_unique_links': len(seen_candidates - seen_detected),
+               'graded_excluded_unique': len(seen_graded),
                'failed_or_repeated_pages': failures, 'no_database_write': True}
     emit('MTS_COVERAGE_SUMMARY ' + json.dumps(summary, ensure_ascii=False))
     # This probe NEVER approves a commit. A clean scan is diagnostic only.
