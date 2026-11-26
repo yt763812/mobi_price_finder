@@ -115,8 +115,10 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                 failures.append(f'{section}: {row["error"]}')
             else:
                 verified_sections.append(section)
-            # Valid priced products are useful even if the category is incomplete.
-            # No destructive full replacement is allowed when any validation fails.
+            # Valid priced products are accumulated, but the worker may perform
+            # a FULL supplier replacement only when every configured category has
+            # completed pagination and has no unresolved detail issues. A mere
+            # product-counter mismatch is a warning when all pages were reached.
             if result.products:
                 results[section] = result
         except Exception as exc:
@@ -141,8 +143,8 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                'verified_sections': verified_sections,
                'partial_products': len(merged['selected']) if merged else 0,
                'confirmed_excluded_urls': len(excluded_urls),
-               'coverage_verified': False,
-               'note': 'Partial results must ONLY use non-destructive merge; unlisted leaf categories may exist.'}
+               'coverage_verified': not failures and merged is not None,
+               'note': 'Full replacement candidate: all configured parent catalogues must complete pagination; missing individual listings are removed from the next snapshot.'}
     emit('FULL_STORE_SUMMARY ' + json.dumps({k:v for k,v in summary.items() if k != 'sections'}, ensure_ascii=False))
     return merged, summary
 
