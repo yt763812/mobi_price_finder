@@ -77,6 +77,8 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
     # Log the actual deployed crawler, rather than assuming GitHub and Railway match.
     emit(f'MTS_CRAWLER_LOADED module={crawler.__module__} file={inspect.getsourcefile(crawler)} version={getattr(__import__(crawler.__module__, fromlist=["CRAWLER_VERSION"]), "CRAWLER_VERSION", "unknown")}')
     results, rows, failures = {}, [], []
+    excluded_urls = set()
+    verified_sections = []
     # Reuse successful verified details across overlapping catalogue sections.
     shared_detail_cache = {}
     workers = int(os.getenv('MTS_DETAIL_WORKERS', '4'))
@@ -106,11 +108,16 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                 row['coverage_warning'] = baseline_message
                 emit(f'COVERAGE_WARNING MTS {section}: {baseline_message}; '
                      'historical baseline alone does not block save')
+            excluded_urls.update(getattr(result, 'excluded_urls', ()) or ())
             if result.incomplete or result.issues or not result.products:
                 row['error'] = row.get('error') or 'incomplete, invalid or empty section'
             if row.get('error'):
                 failures.append(f'{section}: {row["error"]}')
             else:
+                verified_sections.append(section)
+            # Valid priced products are useful even if the category is incomplete.
+            # No destructive full replacement is allowed when any validation fails.
+            if result.products:
                 results[section] = result
         except Exception as exc:
             emit('MTS_EXCEPTION_TRACEBACK ' + traceback.format_exc())
@@ -118,15 +125,24 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
             failures.append(f'{section}: {row["error"]}')
         rows.append(row)
         emit('SECTION ' + json.dumps(row, ensure_ascii=False))
-    # Do not build/write a partial snapshot.
-    merged = merge_catalogue(results, sections) if not failures else None
+    # Build a non-destructive partial candidate without bypassing crawl warnings.
+    merged = merge_catalogue(results, sections) if results else None
+    if merged is not None:
+        merged["excluded_urls"] = sorted(excluded_urls)
+        # Never upsert an item declared a preorder/graded elsewhere.
+        merged["selected"] = {k: v for k, v in merged["selected"].items()
+                              if v["url"] not in excluded_urls}
     summary = {'sections': rows, 'failed': failures,
                'total_unique_products': len(merged['selected']) if merged else 0,
                'duplicates_removed': merged['duplicates_removed'] if merged else 0,
                'conflicts_excluded': merged['conflicts_excluded'] if merged else [],
                'ready_to_commit': not failures and merged is not None and bool(merged['selected']),
+               'partial_ready': merged is not None and bool(merged['selected']),
+               'verified_sections': verified_sections,
+               'partial_products': len(merged['selected']) if merged else 0,
+               'confirmed_excluded_urls': len(excluded_urls),
                'coverage_verified': False,
-               'note': 'All configured sections checked; unlisted leaf categories may exist.'}
+               'note': 'Partial results must ONLY use non-destructive merge; unlisted leaf categories may exist.'}
     emit('FULL_STORE_SUMMARY ' + json.dumps({k:v for k,v in summary.items() if k != 'sections'}, ensure_ascii=False))
     return merged, summary
 
