@@ -17,7 +17,7 @@ from scrapers.mts import CardsParser, read_price
 from scrapers.mts_crawl import PaginationLinks, page_number
 from scrapers.mts_modern import discover_cards, detail_offer, _product_link
 
-CRAWLER_VERSION = "mts-v4.0-graded-exclusions-20261125"
+CRAWLER_VERSION = "mts-v4.1-safe-partial-20261126"
 
 
 def valid_store_product_url(url, catalogue_url):
@@ -61,6 +61,7 @@ class CatalogResult:
     pagination_anomalies: list = None
     preorder_skipped: int = 0
     graded_skipped: int = 0
+    excluded_urls: tuple = ()  # explicit preorder / graded URL; never a network error
 
 
 class _VisiblePrices(HTMLParser):
@@ -228,6 +229,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
     graded_skipped = 0
     seen_preorder_urls = set()
     seen_graded_urls = set()
+    explicitly_excluded_urls = set()
     incomplete = False
     pagination_probe_count = 0
     pagination_anomalies = []
@@ -290,6 +292,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             error = 'detail returned missing/invalid verified SKU or price'
         if error == 'MTS_PREORDER_SKIP':
             preorder_skipped += 1
+            explicitly_excluded_urls.add(card.url)
         elif error is not None:
             if is_transient_detail_error(error) and recovery_attempts:
                 transient_failures[key] = (card, error)
@@ -389,6 +392,8 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             unseen_graded = graded_urls - seen_graded_urls
             seen_preorder_urls.update(unseen_preorders)
             seen_graded_urls.update(unseen_graded)
+            explicitly_excluded_urls.update(unseen_preorders)
+            explicitly_excluded_urls.update(unseen_graded)
             preorder_skipped += len(unseen_preorders)
             graded_skipped += len(unseen_graded)
             seen_urls.update(page_urls)
@@ -417,6 +422,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                     if re.search(r'\bпредзаказ\b', card.availability or '', re.I):
                         if url not in seen_preorder_urls:
                             seen_preorder_urls.add(url)
+                            explicitly_excluded_urls.add(url)
                             preorder_skipped += 1
                         continue
                     issues.append((card.sku, f'no full advertised price: {card.displayed_price!r}'))
@@ -519,6 +525,7 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                           f'url={card.url}', flush=True)
                 elif error == 'MTS_PREORDER_SKIP':
                     preorder_skipped += 1
+                    explicitly_excluded_urls.add(card.url)
                 else:
                     error = error or 'detail returned missing/invalid SKU or price'
                     remaining[key] = (card, error)
@@ -556,6 +563,6 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
             products[key] = replace(original, price=resolved)
             print(f'MTS catalog-only {category}: CONFLICT RESOLVED sku={sku} url={url} '
                   f'price={resolved}; {reason}', flush=True)
-    result = CatalogResult(list(products.values()), len(visited), cards_total, issues, incomplete, conflicts, pagination_probe_count, pagination_anomalies, preorder_skipped, graded_skipped)
+    result = CatalogResult(list(products.values()), len(visited), cards_total, issues, incomplete, conflicts, pagination_probe_count, pagination_anomalies, preorder_skipped, graded_skipped, tuple(sorted(explicitly_excluded_urls)))
     print(f'MTS_CRAWLER_RETURN {CRAWLER_VERSION} section={category} pages={result.pages} cards={result.cards} priced={len(result.products)} preorders_skipped={result.preorder_skipped} graded_skipped={result.graded_skipped} issues={len(result.issues)} incomplete={result.incomplete}', flush=True)
     return result
