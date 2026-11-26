@@ -67,3 +67,125 @@ def replace_full_store(merged):
                     json.dumps(warnings,ensure_ascii=False),p.get('ram_gb'),price,url,category))
             cur.execute("UPDATE suppliers SET currency='BYN',tax_status='unknown', validity_hours=48,last_price_import_at=now() WHERE id=%s", (sid,))
     return {'supplier_id':sid,'saved':len(prepared)}
+
+
+def merge_partial_full_store(merged):
+    """Non-destructive, scraper-owned MTS update.
+
+    Upsert verified priced URLs; delete ONLY explicitly classified preorder/graded
+    URLs; retain all other previously saved offers and mark them unverified.
+    This is not an atomic full-store replacement.
+    """
+    from database import _connect
+    from product_parser import parse_product
+    from web_supplier_snapshot import SUPPLIER_NAME
+
+    if not merged or not merged.get('selected'):
+        raise ValueError('Refusing partial update without verified priced offers')
+    excluded = set(merged.get('excluded_urls') or [])
+    for url in excluded:
+        parts = urlsplit(url)
+        if parts.scheme != 'https' or parts.hostname != SUPPLIER_NAME or parts.query or parts.fragment:
+            raise ValueError(f'Unsafe exclusion URL: {url}')
+
+    prepared = []
+    seen = set()
+    for record in merged['selected'].values():
+        item, category, url = record['item'], record['section'], record['url']
+        price = Decimal(str(item.price))
+        if (not item.sku or not item.name or item.currency != 'BYN' or
+            urlsplit(url).scheme != 'https' or urlsplit(url).hostname != SUPPLIER_NAME or
+            not price.is_finite() or price <= 0 or not category):
+            raise ValueError(f'Invalid MTS item: {url}')
+        if url in excluded:
+            continue
+        sig = hashlib.sha256(('mts:' + url).encode()).hexdigest()
+        if sig in seen:
+            raise ValueError(f'Duplicate URL: {url}')
+        seen.add(sig)
+        parsed = parse_product(item.name)
+        warnings = list(parsed.get('warnings') or [])
+        warnings.append('Публичная цена МТС; условия покупки юридическим лицом не подтверждены')
+        if getattr(item, 'approximate', False):
+            warnings.append('Цена указана «от»')
+        prepared.append((sig, item, category, url, price, parsed, warnings))
+    if not prepared:
+        raise ValueError('Refusing partial update with zero safe priced offers')
+
+    stale_note = 'МТС: цена сохранена с предыдущего обхода; в текущем запуске не подтверждена'
+    stale_json = json.dumps([stale_note], ensure_ascii=False)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''CREATE TABLE IF NOT EXISTS web_supplier_registry (
+                shop TEXT PRIMARY KEY,
+                supplier_id BIGINT NOT NULL UNIQUE REFERENCES suppliers(id) ON DELETE RESTRICT)''')
+            cur.execute('ALTER TABLE offers ADD COLUMN IF NOT EXISTS source_url TEXT')
+            cur.execute('ALTER TABLE offers ADD COLUMN IF NOT EXISTS web_category TEXT')
+            cur.execute('SELECT pg_advisory_xact_lock(%s)', (77504432,))
+            cur.execute('SELECT supplier_id FROM web_supplier_registry WHERE shop=%s FOR UPDATE', ('mts',))
+            record = cur.fetchone()
+            if record:
+                sid = record['supplier_id']
+                cur.execute('SELECT name FROM suppliers WHERE id=%s FOR UPDATE', (sid,))
+                supplier = cur.fetchone()
+                if not supplier or supplier['name'] != SUPPLIER_NAME:
+                    raise RuntimeError('Registered MTS supplier changed; refusing write')
+            else:
+                cur.execute('SELECT id FROM suppliers WHERE name=%s', (SUPPLIER_NAME,))
+                if cur.fetchone():
+                    raise RuntimeError('Existing unmanaged MTS supplier; refusing adoption')
+                cur.execute("INSERT INTO suppliers(name,validity_hours,currency,tax_status) "
+                            "VALUES (%s,48,'BYN','unknown') RETURNING id", (SUPPLIER_NAME,))
+                sid = cur.fetchone()['id']
+                cur.execute('INSERT INTO web_supplier_registry(shop,supplier_id) VALUES (%s,%s)', ('mts', sid))
+
+            # Set a visible warning on offers which this run does NOT verify.
+            # Upsert below replaces the warnings on successfully checked items.
+            cur.execute('''UPDATE offers SET warnings = warnings || %s::jsonb
+                WHERE supplier_id=%s AND NOT (warnings @> %s::jsonb)''',
+                (stale_json, sid, stale_json))
+            cur.execute('SELECT signature FROM offers WHERE supplier_id=%s', (sid,))
+            before = {row['signature'] for row in cur.fetchall()}
+
+            # Only remove confirmed exclusions, never missing/unreachable products.
+            excluded_removed = 0
+            for url in sorted(excluded):
+                sig = hashlib.sha256(('mts:' + url).encode()).hexdigest()
+                cur.execute('DELETE FROM offers WHERE supplier_id=%s AND signature=%s AND source_url=%s',
+                            (sid, sig, url))
+                excluded_removed += cur.rowcount
+
+            inserted = updated = 0
+            for sig, item, category, url, price, parsed, warnings in prepared:
+                cur.execute('''INSERT INTO offers (
+                    supplier_id,signature,original_name,brand,model,storage_gb,color,region,sim,
+                    condition_tags,warnings,ram_gb,price,currency,tax_status,source_url,web_category,updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,'BYN','unknown',%s,%s,now())
+                ON CONFLICT (supplier_id,signature) DO UPDATE SET
+                    original_name=EXCLUDED.original_name, brand=EXCLUDED.brand,
+                    model=EXCLUDED.model, storage_gb=EXCLUDED.storage_gb,
+                    color=EXCLUDED.color, region=EXCLUDED.region, sim=EXCLUDED.sim,
+                    condition_tags=EXCLUDED.condition_tags, warnings=EXCLUDED.warnings,
+                    ram_gb=EXCLUDED.ram_gb, price=EXCLUDED.price,
+                    currency=EXCLUDED.currency, tax_status=EXCLUDED.tax_status,
+                    source_url=EXCLUDED.source_url, web_category=EXCLUDED.web_category,
+                    updated_at=now()''',
+                    (sid, sig, item.name, parsed.get('brand'), parsed.get('model'),
+                     parsed.get('storage_gb'), parsed.get('color'), parsed.get('region'),
+                     parsed.get('sim'), json.dumps(parsed.get('condition') or [], ensure_ascii=False),
+                     json.dumps(warnings, ensure_ascii=False), parsed.get('ram_gb'),
+                     price, url, category))
+                if sig in before:
+                    updated += 1
+                else:
+                    inserted += 1
+            # last_price_import_at records a partial refresh; retained old offers
+            # stay visibly marked as not confirmed and preserve their updated_at.
+            cur.execute("UPDATE suppliers SET currency='BYN',tax_status='unknown', "
+                        "validity_hours=48,last_price_import_at=now() WHERE id=%s", (sid,))
+            cur.execute('SELECT count(*) AS n FROM offers WHERE supplier_id=%s AND warnings @> %s::jsonb',
+                        (sid, stale_json))
+            retained_not_rechecked = cur.fetchone()['n']
+    return {'supplier_id': sid, 'inserted': inserted, 'updated': updated,
+            'excluded_removed': excluded_removed,
+            'retained_not_rechecked': retained_not_rechecked}
