@@ -17,7 +17,7 @@ from scrapers.mts import CardsParser, read_price
 from scrapers.mts_crawl import PaginationLinks, page_number
 from scrapers.mts_modern import discover_cards, detail_offer, _product_link
 
-CRAWLER_VERSION = "mts-v4.1-safe-partial-20261126"
+CRAWLER_VERSION = "mts-v4.2-parent-catalog-full-replace-20261126"
 
 
 def valid_store_product_url(url, catalogue_url):
@@ -206,6 +206,28 @@ def catalogue_page_url(catalogue_url, number):
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), ''))
 
 
+def merge_card_sources(legacy_cards, modern_cards, page_url):
+    """Merge legacy and modern card parsers from the SAME parent catalogue page.
+
+    MTS can mix markup generations on one page. The old fallback only ran the
+    modern parser when there were zero legacy cards, silently dropping modern
+    cards whenever a page contained even one legacy card.
+    """
+    merged = list(legacy_cards or [])
+    seen = set()
+    for card in merged:
+        raw = getattr(card, 'url', '') or ''
+        if raw:
+            seen.add(urljoin(page_url, raw))
+    for card in modern_cards or []:
+        raw = getattr(card, 'url', '') or ''
+        absolute = urljoin(page_url, raw) if raw else ''
+        if absolute and absolute not in seen:
+            merged.append(card)
+            seen.add(absolute)
+    return merged
+
+
 def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_products=3000,
                       detail_workers=4, detail_cache=None):
     if not (1 <= max_pages <= 100 and 1 <= max_products <= 10000):
@@ -336,9 +358,14 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
                         advertised_total = total
             parser = CardsParser()
             parser.feed(html)
-            modern = []
-            if not parser.cards:
-                modern = discover_cards(html, page_url)
+            # IMPORTANT: parse both markup generations on every parent page.
+            # MTS currently mixes legacy and modern product cards in the same
+            # listing. Running modern discovery only when legacy_cards is empty
+            # loses modern cards on partially legacy pages.
+            modern_candidates = discover_cards(html, page_url)
+            all_cards = merge_card_sources(parser.cards, modern_candidates, page_url)
+            legacy_urls = {urljoin(page_url, c.url or '') for c in parser.cards if c.url}
+            modern = [c for c in all_cards if urljoin(page_url, c.url or '') not in legacy_urls]
             # A catalogue page can consist entirely of "Предзаказ" cards.
             # The priced-card selector deliberately excludes those cards.
             preorders = discover_catalogue_preorders(html, page_url)
@@ -545,11 +572,21 @@ def crawl_mts_catalog(fetcher, catalogue_url, category, max_pages=50, max_produc
     # catalogue counters; do not declare a large unexplained gap complete.
     if (advertised_total is not None and first_page_size is not None
             and cards_total + first_page_size < advertised_total):
-        incomplete = True
-        pagination_anomalies.append(
-            f'advertised {advertised_total} cards, only {cards_total} accounted for '
+        counter_note = (
+            f'advertised {advertised_total} cards, {cards_total} accounted for '
             f'(including {preorder_skipped} confirmed preorders and '
             f'{graded_skipped} graded exclusions)')
+        # A mutable catalogue counter can be stale or include cards not exposed
+        # in the public listing. If every advertised page was fetched, this is a
+        # coverage warning, not by itself a reason to preserve yesterday's price.
+        # Actual pagination gaps/repeated pages and unresolved detail errors still
+        # set incomplete/issues and continue to block a destructive replacement.
+        if expected_page_count is not None and len(visited) >= expected_page_count:
+            pagination_anomalies.append('COUNTER_WARNING: ' + counter_note)
+            print(f'MTS_COVERAGE_WARNING section={category} {counter_note}', flush=True)
+        else:
+            incomplete = True
+            pagination_anomalies.append(counter_note)
     # One detail request per conflicting URL, not one per product.
     for sku, url, original in conflicts:
         key = hashlib.sha256(url.encode('utf-8')).hexdigest()
