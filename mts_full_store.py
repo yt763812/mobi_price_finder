@@ -18,6 +18,29 @@ PRIORITY = ('smartphones','tablets','laptops','watches','headphones','television
 ALL_SECTIONS = tuple(SECTIONS)
 
 
+def partition_detail_issues(issues, cards):
+    """Allow a very small number of exact HTTP 404 detail failures.
+
+    A listing whose detail URL returns 404 is omitted from today's full
+    replacement; yesterday's stale price must not survive. Network timeouts,
+    5xx responses, parse failures, and a large spike of 404s still block save.
+    """
+    missing, blocking = [], []
+    for issue in issues or ():
+        representation = str(issue)
+        if re.search(r'detail HTTP/parse failure: HTTPError: HTTP Error 404: Not Found', representation):
+            missing.append(representation)
+        else:
+            blocking.append(representation)
+    # Guard against a broken site suddenly returning 404 for many listings.
+    allowance = max(1, min(3, cards // 100))
+    if len(missing) > allowance:
+        blocking.extend(missing)
+        return [], blocking
+    return missing, blocking
+
+
+
 def name_key(s):
     return ' '.join(unicodedata.normalize('NFKC', str(s)).casefold().split())
 
@@ -93,10 +116,12 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                 result = crawler(retrying, SECTIONS[section], section, max_pages=max_pages)
             if result is None:
                 raise RuntimeError('MTS crawler returned None before creating CatalogResult; check deployed scrapers/mts_store_catalog_v4.py (possible truncated or malformed upload)')
+            missing_404, blocking_issues = partition_detail_issues(result.issues, result.cards)
             row = {'section': section, 'pages': result.pages, 'cards': result.cards,
                    'priced': len(result.products), 'preorders_skipped': getattr(result, 'preorder_skipped', 0),
                    'graded_skipped': getattr(result, 'graded_skipped', 0),
-                   'issues': [str(x) for x in result.issues],
+                   'issues': blocking_issues,
+                   'missing_detail_404': len(missing_404),
                    'incomplete': bool(result.incomplete),
                    'conflicts': len(result.conflicts or []),
                    'pagination_anomalies': result.pagination_anomalies or []}
@@ -109,7 +134,9 @@ def collect_full_store(*, max_pages=100, delay=2.0, emit=print, sections=ALL_SEC
                 emit(f'COVERAGE_WARNING MTS {section}: {baseline_message}; '
                      'historical baseline alone does not block save')
             excluded_urls.update(getattr(result, 'excluded_urls', ()) or ())
-            if result.incomplete or result.issues or not result.products:
+            if missing_404:
+                emit(f'MTS_MISSING_DETAIL_404 section={section} skipped={len(missing_404)} URLs=' + json.dumps(missing_404, ensure_ascii=False))
+            if result.incomplete or blocking_issues or not result.products:
                 row['error'] = row.get('error') or 'incomplete, invalid or empty section'
             if row.get('error'):
                 failures.append(f'{section}: {row["error"]}')
